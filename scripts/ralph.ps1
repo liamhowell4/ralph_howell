@@ -196,10 +196,32 @@ function Start-MonitorDashboard {
     $monitorPort = 3500
 
     # Check if already running
-    if (Test-PortInUse -Port $monitorPort) {
-        if (Test-ApiHealth -Port $monitorPort) {
+    $portInUse = Test-PortInUse -Port $monitorPort
+    Write-RalphLog "Port $monitorPort in use: $portInUse" -Level "DEBUG"
+
+    if ($portInUse) {
+        $isHealthy = Test-ApiHealth -Port $monitorPort
+        Write-RalphLog "Health check result: $isHealthy" -Level "DEBUG"
+
+        if ($isHealthy) {
             Write-RalphLog "Monitor dashboard already running on port $monitorPort" -Level "INFO"
             return $true
+        } else {
+            # Port in use but unhealthy - kill the zombie process
+            Write-RalphLog "Found unhealthy process on port $monitorPort, cleaning up..." -Level "INFO"
+            try {
+                $conn = Get-NetTCPConnection -LocalPort $monitorPort -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($conn) {
+                    Write-RalphLog "Killing process $($conn.OwningProcess) on port $monitorPort" -Level "INFO"
+                    Stop-Process -Id $conn.OwningProcess -Force -ErrorAction Stop
+                    Start-Sleep -Seconds 1
+                    Write-RalphLog "Process killed successfully" -Level "DEBUG"
+                } else {
+                    Write-RalphLog "Could not find process holding port $monitorPort" -Level "WARN"
+                }
+            } catch {
+                Write-RalphLog "Failed to cleanup stale process: $_" -Level "ERROR"
+            }
         }
     }
 
@@ -223,15 +245,23 @@ function Start-MonitorDashboard {
         $psi.RedirectStandardError = $true
 
         $script:MonitorProcess = [System.Diagnostics.Process]::Start($psi)
+        Write-RalphLog "Started monitor process (PID: $($script:MonitorProcess.Id))" -Level "DEBUG"
 
         # Wait for server to start
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 3
+
+        # Check if process is still running
+        if ($script:MonitorProcess.HasExited) {
+            $stderr = $script:MonitorProcess.StandardError.ReadToEnd()
+            Write-RalphLog "Monitor process exited early. Exit code: $($script:MonitorProcess.ExitCode). Error: $stderr" -Level "ERROR"
+            return $false
+        }
 
         if (Test-ApiHealth -Port $monitorPort) {
             Write-RalphLog "Monitor dashboard started on port $monitorPort" -Level "INFO"
             return $true
         } else {
-            Write-RalphLog "Monitor dashboard failed to start" -Level "WARN"
+            Write-RalphLog "Monitor dashboard failed health check on port $monitorPort" -Level "WARN"
             return $false
         }
     } catch {
@@ -272,9 +302,17 @@ function Start-ProjectApi {
         $psi.RedirectStandardError = $true
 
         $script:ApiProcess = [System.Diagnostics.Process]::Start($psi)
+        Write-RalphLog "Started project API process (PID: $($script:ApiProcess.Id)) on port $port" -Level "DEBUG"
 
         # Wait for server to start
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 3
+
+        # Check if process is still running
+        if ($script:ApiProcess.HasExited) {
+            $stderr = $script:ApiProcess.StandardError.ReadToEnd()
+            Write-RalphLog "Project API exited early. Exit code: $($script:ApiProcess.ExitCode). Error: $stderr" -Level "ERROR"
+            return $null
+        }
 
         if (Test-ApiHealth -Port $port) {
             Write-RalphLog "Project API started on port $port" -Level "INFO"
@@ -287,7 +325,7 @@ function Start-ProjectApi {
 
             return $port
         } else {
-            Write-RalphLog "Project API failed to start" -Level "WARN"
+            Write-RalphLog "Project API failed health check on port $port" -Level "WARN"
             return $null
         }
     } catch {

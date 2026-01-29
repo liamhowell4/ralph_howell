@@ -14,7 +14,7 @@
 
 import express from 'express';
 import cors from 'cors';
-import { readFileSync, writeFileSync, existsSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, statSync, renameSync } from 'fs';
 import { join } from 'path';
 
 // Parse arguments
@@ -54,9 +54,7 @@ function writeJsonFile(filename, data) {
   const tempPath = `${filepath}.tmp`;
   try {
     writeFileSync(tempPath, JSON.stringify(data, null, 2));
-    // Atomic rename
-    const fs = await import('fs');
-    fs.renameSync(tempPath, filepath);
+    renameSync(tempPath, filepath);
     return true;
   } catch (e) {
     console.error(`Error writing ${filename}:`, e.message);
@@ -193,11 +191,7 @@ app.post('/api/config', async (req, res) => {
 
   try {
     writeFileSync(tempPath, JSON.stringify(merged, null, 2));
-
-    // Manual rename since we can't use await at top level easily
-    const fs = await import('fs');
-    fs.renameSync(tempPath, filepath);
-
+    renameSync(tempPath, filepath);
     res.json({ success: true, config: merged });
   } catch (e) {
     console.error('Error writing config:', e.message);

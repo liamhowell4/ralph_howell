@@ -12,7 +12,7 @@
 # ============================================================================
 
 $script:DefaultConfig = @{
-    model = "claude-opus-4-5-20250514"
+    model = "claude-opus-4-5-20251101"
     maxIterations = 50
     maxTurnsPerIteration = 50
     rateLimiting = @{
@@ -470,33 +470,18 @@ function ConvertFrom-MarkdownPrd {
     $mdContent = Get-Content -Path $MarkdownPath -Raw
 
     $transformPrompt = @"
-Transform the following markdown PRD into a structured JSON format.
+You are a JSON generator. Your ONLY output must be valid JSON - no explanations, no markdown, no text before or after.
 
-The output must be valid JSON with this exact structure:
-{
-  "projectName": "string - name of the project",
-  "description": "string - brief project description",
-  "tasks": [
-    {
-      "id": "number - sequential starting from 1",
-      "title": "string - task title",
-      "description": "string - detailed task description",
-      "status": "pending",
-      "acceptanceCriteria": ["array of strings describing completion criteria"],
-      "dependencies": ["array of task IDs this depends on, empty if none"]
-    }
-  ]
-}
+Convert this PRD to JSON with this structure:
+{"projectName":"string","description":"string","tasks":[{"id":1,"title":"string","description":"string","status":"pending","acceptanceCriteria":["string"],"dependencies":[]}]}
 
 Rules:
-1. Extract ALL tasks from the markdown
-2. Break down large tasks into smaller, actionable items
-3. Set all statuses to "pending"
-4. Identify dependencies between tasks
-5. Write clear acceptance criteria for each task
-6. Output ONLY valid JSON, no markdown code blocks or explanation
+- Extract ALL tasks from the Task Checklist section
+- Each checkbox item becomes a task
+- Set all statuses to "pending"
+- Output ONLY the JSON object, nothing else
 
-Markdown PRD:
+PRD content:
 $mdContent
 "@
 
@@ -505,15 +490,40 @@ $mdContent
     try {
         $result = claude -p $transformPrompt --output-format json 2>&1
 
-        # Parse the JSON response
+        # Parse the JSON response from Claude CLI
         $jsonContent = $result | Out-String
 
-        # Try to extract JSON if wrapped in other content
-        if ($jsonContent -match '(?s)\{.*\}') {
-            $jsonContent = $Matches[0]
+        # Claude CLI with --output-format json returns: {"type":"result","result":"...content..."}
+        # The actual response is in the .result property as a string
+        $cliResponse = $null
+        try {
+            $cliResponse = $jsonContent | ConvertFrom-Json
+        } catch {
+            Write-RalphLog "CLI response is not valid JSON, trying raw extraction" -Level "DEBUG"
         }
 
-        $prd = $jsonContent | ConvertFrom-Json
+        $prdContent = $null
+        if ($cliResponse -and $cliResponse.type -eq "result" -and $cliResponse.result) {
+            # Extract the actual content from the CLI wrapper
+            $prdContent = $cliResponse.result
+            Write-RalphLog "Extracted result from CLI wrapper (length: $($prdContent.Length))" -Level "DEBUG"
+        } else {
+            # Use raw content
+            $prdContent = $jsonContent
+        }
+
+        # Strip markdown code blocks if present (```json ... ```)
+        if ($prdContent -match '(?s)```(?:json)?\s*(\{.+\})\s*```') {
+            $prdContent = $Matches[1]
+            Write-RalphLog "Extracted JSON from markdown code block" -Level "DEBUG"
+        }
+        # Extract JSON object if mixed with other text
+        elseif ($prdContent -match '(?s)(\{"projectName".+\})') {
+            $prdContent = $Matches[1]
+            Write-RalphLog "Extracted JSON object from mixed content" -Level "DEBUG"
+        }
+
+        $prd = $prdContent | ConvertFrom-Json
 
         if (-not $prd.tasks -or $prd.tasks.Count -eq 0) {
             Write-RalphLog "PRD transformation produced no tasks" -Level "ERROR"
@@ -524,6 +534,11 @@ $mdContent
         return $prd
     } catch {
         Write-RalphLog "Failed to transform markdown PRD: $_" -Level "ERROR"
+        if ($prdContent) {
+            Write-RalphLog "Content being parsed (first 300 chars): $($prdContent.Substring(0, [Math]::Min(300, $prdContent.Length)))" -Level "WARN"
+        } elseif ($jsonContent) {
+            Write-RalphLog "Raw CLI response (first 300 chars): $($jsonContent.Substring(0, [Math]::Min(300, $jsonContent.Length)))" -Level "WARN"
+        }
         return $null
     }
 }
@@ -1103,8 +1118,15 @@ function Invoke-Claude {
         try {
             Write-RalphLog "Invoking Claude (attempt $($attempt + 1))..." -Level "DEBUG"
 
-            $result = claude -p $Prompt --model $Model --max-turns $MaxTurns --output-format json 2>&1
+            # Use --dangerously-skip-permissions to allow file operations without prompts
+            $result = claude -p $Prompt --model $Model --max-turns $MaxTurns --dangerously-skip-permissions --output-format json 2>&1
             $output = $result | Out-String
+
+            Write-RalphLog "Claude response length: $($output.Length) chars" -Level "DEBUG"
+
+            # Log first part of response for debugging
+            $preview = if ($output.Length -gt 200) { $output.Substring(0, 200) + "..." } else { $output }
+            Write-RalphLog "Claude response preview: $preview" -Level "DEBUG"
 
             return @{
                 Success = $true
