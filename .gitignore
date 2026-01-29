@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Ralph runtime files
+.ralph/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Build output
+dist/
