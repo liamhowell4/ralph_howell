@@ -253,6 +253,16 @@ function Start-MonitorDashboard {
         # Check if process is still running
         if ($script:MonitorProcess.HasExited) {
             $stderr = $script:MonitorProcess.StandardError.ReadToEnd()
+
+            # Check if it failed because monitor is already running (EADDRINUSE)
+            if ($stderr -match "EADDRINUSE") {
+                # Another monitor is running - check if it's healthy
+                if (Test-ApiHealth -Port $monitorPort) {
+                    Write-RalphLog "Monitor dashboard already running on port $monitorPort (detected via EADDRINUSE)" -Level "INFO"
+                    return $true
+                }
+            }
+
             Write-RalphLog "Monitor process exited early. Exit code: $($script:MonitorProcess.ExitCode). Error: $stderr" -Level "ERROR"
             return $false
         }
@@ -446,7 +456,13 @@ function Start-RalphLoop {
         $prompt = Build-IterationPrompt -Task $currentTask -Prd $prd -Iteration $iteration
 
         # Invoke Claude
-        $result = Invoke-Claude -Prompt $prompt -Model $config.model -MaxTurns $config.maxTurnsPerIteration
+        $result = Invoke-Claude `
+            -Prompt $prompt `
+            -Model $config.model `
+            -MaxTurns $config.maxTurnsPerIteration `
+            -Iteration $iteration `
+            -TaskId $currentTask.id `
+            -TaskTitle $currentTask.title
 
         if (-not $result.Success) {
             Write-RalphLog "Claude invocation failed: $($result.Error)" -Level "ERROR"
@@ -643,9 +659,8 @@ function Main {
 
     # Handle new setup
     if ($action -eq "new" -or $action -eq "reinit") {
-        if (-not (Test-RalphExists)) {
-            Initialize-RalphDirectory
-        }
+        # Always ensure .ralph directory and files exist (safe to call multiple times)
+        Initialize-RalphDirectory
 
         if ($prdType -eq "markdown") {
             Write-RalphLog "Transforming markdown PRD: $prdPath" -Level "INFO"

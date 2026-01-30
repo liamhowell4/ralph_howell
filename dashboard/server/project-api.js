@@ -215,13 +215,90 @@ app.post('/api/stop', (req, res) => {
 });
 
 /**
- * Get file changes (from git)
+ * Get file changes (from git - last commit + uncommitted)
  */
 app.get('/api/changes', (req, res) => {
-  const state = readJsonFile('state.json');
-  res.json({
-    filesChanged: state?.filesChanged || []
-  });
+  const { execSync } = require('child_process');
+
+  try {
+    // Get files from the most recent commit
+    let lastCommitFiles = [];
+    try {
+      const lastCommit = execSync('git diff-tree --no-commit-id --name-only -r HEAD', {
+        cwd: PROJECT_PATH,
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'] // Capture stderr to avoid shell redirection issues
+      }).trim();
+      if (lastCommit) {
+        lastCommitFiles = lastCommit.split('\n').filter(f => f);
+      }
+    } catch (e) {
+      // No commits yet or not a git repo
+      console.log('Could not get last commit files:', e.message);
+    }
+
+    // Get currently uncommitted changes
+    let uncommittedFiles = [];
+    try {
+      const status = execSync('git status --porcelain', {
+        cwd: PROJECT_PATH,
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe']
+      }).trim();
+      if (status) {
+        uncommittedFiles = status.split('\n')
+          .filter(line => line)
+          .map(line => line.slice(3)); // Remove status prefix (e.g., " M ", "?? ")
+      }
+    } catch (e) {
+      // Not a git repo
+      console.log('Could not get uncommitted files:', e.message);
+    }
+
+    // Combine and dedupe
+    const allFiles = [...new Set([...lastCommitFiles, ...uncommittedFiles])];
+
+    console.log(`File changes: ${allFiles.length} files (${lastCommitFiles.length} from last commit, ${uncommittedFiles.length} uncommitted)`);
+
+    res.json({
+      filesChanged: allFiles,
+      lastCommitFiles,
+      uncommittedFiles
+    });
+  } catch (e) {
+    console.error('Error getting file changes:', e.message);
+    res.json({ filesChanged: [], lastCommitFiles: [], uncommittedFiles: [] });
+  }
+});
+
+/**
+ * Get conversation log (prompts and responses)
+ */
+app.get('/api/conversations', (req, res) => {
+  const limit = parseInt(req.query.limit) || 10;
+  const filepath = join(RALPH_DIR, 'conversations.json');
+
+  if (!existsSync(filepath)) {
+    return res.json({ conversations: [] });
+  }
+
+  try {
+    const content = readFileSync(filepath, 'utf8');
+    let conversations = JSON.parse(content);
+
+    // Return most recent conversations
+    if (conversations.length > limit) {
+      conversations = conversations.slice(-limit);
+    }
+
+    // Reverse so most recent is first
+    conversations = conversations.reverse();
+
+    res.json({ conversations });
+  } catch (e) {
+    console.error('Error reading conversations:', e.message);
+    res.json({ conversations: [] });
+  }
 });
 
 /**

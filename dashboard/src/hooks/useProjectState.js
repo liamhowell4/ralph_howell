@@ -5,7 +5,8 @@ import {
   fetchProjectConfig,
   fetchProjectLogs,
   fetchRateLimit,
-  fetchFileChanges
+  fetchFileChanges,
+  fetchConversations
 } from '../api';
 
 /**
@@ -20,6 +21,7 @@ export function useProjectState(port, pollInterval = 3000) {
   const [logs, setLogs] = useState([]);
   const [rateLimit, setRateLimit] = useState(null);
   const [changes, setChanges] = useState([]);
+  const [conversations, setConversations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -27,13 +29,14 @@ export function useProjectState(port, pollInterval = 3000) {
     if (!port) return;
 
     try {
-      const [stateData, prdData, configData, logsData, rateLimitData, changesData] = await Promise.all([
+      const [stateData, prdData, configData, logsData, rateLimitData, changesData, conversationsData] = await Promise.all([
         fetchProjectState(port).catch(() => null),
         fetchProjectPrd(port).catch(() => null),
         fetchProjectConfig(port).catch(() => null),
         fetchProjectLogs(port, 50).catch(() => ({ lines: [] })),
         fetchRateLimit(port).catch(() => null),
-        fetchFileChanges(port).catch(() => ({ filesChanged: [] }))
+        fetchFileChanges(port).catch(() => ({ filesChanged: [] })),
+        fetchConversations(port, 10).catch(() => ({ conversations: [] }))
       ]);
 
       setState(stateData);
@@ -42,6 +45,7 @@ export function useProjectState(port, pollInterval = 3000) {
       setLogs(logsData.lines || []);
       setRateLimit(rateLimitData);
       setChanges(changesData.filesChanged || []);
+      setConversations(conversationsData.conversations || []);
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -65,6 +69,7 @@ export function useProjectState(port, pollInterval = 3000) {
     logs,
     rateLimit,
     changes,
+    conversations,
     loading,
     error,
     refresh

@@ -15,6 +15,7 @@ $script:DefaultConfig = @{
     model = "claude-opus-4-5-20251101"
     maxIterations = 50
     maxTurnsPerIteration = 50
+    iterationTimeoutMinutes = 15  # Kill iterations that take longer than this
     rateLimiting = @{
         maxCallsPerHour = 100
         cooldownSeconds = 10
@@ -42,6 +43,7 @@ $script:PrdFile = "prd.json"
 $script:LogFile = "ralph.log"
 $script:TimestampsFile = "call_timestamps.json"
 $script:StopSignalFile = "stop.signal"
+$script:ConversationsFile = "conversations.json"
 
 # ============================================================================
 # LOGGING
@@ -292,8 +294,14 @@ function Update-RalphState {
 
     $state = Get-RalphState -ProjectPath $ProjectPath
     if (-not $state) {
-        Write-RalphLog "No state to update" -Level "ERROR"
-        return
+        # State doesn't exist - initialize it first
+        Write-RalphLog "State file missing, initializing..." -Level "DEBUG"
+        Initialize-RalphDirectory -ProjectPath $ProjectPath
+        $state = Get-RalphState -ProjectPath $ProjectPath
+        if (-not $state) {
+            Write-RalphLog "Failed to initialize state" -Level "ERROR"
+            return
+        }
     }
 
     # Convert PSCustomObject to hashtable for merging
@@ -803,7 +811,7 @@ function Find-AvailablePort {
 function Test-PortInUse {
     <#
     .SYNOPSIS
-        Checks if a port is in use
+        Checks if a port is in use (checks both IPv4 and IPv6)
     #>
     [CmdletBinding()]
     param(
@@ -811,14 +819,25 @@ function Test-PortInUse {
         [int]$Port
     )
 
+    # Try IPv4 any interface
     try {
-        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $Port)
         $listener.Start()
         $listener.Stop()
-        return $false
     } catch {
         return $true
     }
+
+    # Try IPv6 any interface (if supported)
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::IPv6Any, $Port)
+        $listener.Start()
+        $listener.Stop()
+    } catch {
+        return $true
+    }
+
+    return $false
 }
 
 function Test-ApiHealth {
@@ -1005,6 +1024,171 @@ function Clear-StopSignal {
 }
 
 # ============================================================================
+# CONVERSATION LOGGING
+# ============================================================================
+
+function Get-ConversationLog {
+    <#
+    .SYNOPSIS
+        Gets the conversation log (all prompts and responses)
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$ProjectPath = (Get-Location).Path,
+        [int]$Limit = 10
+    )
+
+    $ralphPath = Get-RalphPath -ProjectPath $ProjectPath
+    $convPath = Join-Path $ralphPath $script:ConversationsFile
+
+    if (-not (Test-Path $convPath)) {
+        return @()
+    }
+
+    try {
+        $content = Get-Content -Path $convPath -Raw
+        $conversations = $content | ConvertFrom-Json
+
+        # Return most recent conversations (limited)
+        if ($conversations.Count -gt $Limit) {
+            return @($conversations | Select-Object -Last $Limit)
+        }
+        return @($conversations)
+    } catch {
+        Write-RalphLog "Failed to read conversation log: $_" -Level "WARN"
+        return @()
+    }
+}
+
+function Add-ConversationEntry {
+    <#
+    .SYNOPSIS
+        Adds a conversation entry (prompt/response pair) to the log
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Iteration,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TaskId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TaskTitle,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [string]$Response,
+
+        [string]$Status = "pending",
+
+        [double]$ElapsedMinutes = 0,
+
+        [string]$ProjectPath = (Get-Location).Path
+    )
+
+    $ralphPath = Get-RalphPath -ProjectPath $ProjectPath
+    $convPath = Join-Path $ralphPath $script:ConversationsFile
+    $tempPath = "$convPath.tmp"
+
+    # Read existing conversations
+    $conversations = @()
+    if (Test-Path $convPath) {
+        try {
+            $content = Get-Content -Path $convPath -Raw
+            $existing = $content | ConvertFrom-Json
+            $conversations = @($existing)
+        } catch {
+            # Start fresh if corrupted
+            $conversations = @()
+        }
+    }
+
+    # Create new entry
+    $entry = @{
+        id = [guid]::NewGuid().ToString()
+        iteration = $Iteration
+        taskId = $TaskId
+        taskTitle = $TaskTitle
+        timestamp = (Get-Date).ToString("o")
+        prompt = $Prompt
+        response = $Response
+        status = $Status
+        elapsedMinutes = $ElapsedMinutes
+    }
+
+    $conversations += $entry
+
+    # Keep only last 50 conversations to prevent unbounded growth
+    if ($conversations.Count -gt 50) {
+        $conversations = @($conversations | Select-Object -Last 50)
+    }
+
+    try {
+        $json = $conversations | ConvertTo-Json -Depth 10
+        Set-Content -Path $tempPath -Value $json -Force
+        Move-Item -Path $tempPath -Destination $convPath -Force
+        return $entry.id
+    } catch {
+        Write-RalphLog "Failed to save conversation entry: $_" -Level "ERROR"
+        return $null
+    }
+}
+
+function Update-ConversationEntry {
+    <#
+    .SYNOPSIS
+        Updates an existing conversation entry with response data
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$EntryId,
+
+        [string]$Response,
+
+        [string]$Status,
+
+        [double]$ElapsedMinutes,
+
+        [string]$Error,
+
+        [string]$ProjectPath = (Get-Location).Path
+    )
+
+    $ralphPath = Get-RalphPath -ProjectPath $ProjectPath
+    $convPath = Join-Path $ralphPath $script:ConversationsFile
+    $tempPath = "$convPath.tmp"
+
+    if (-not (Test-Path $convPath)) {
+        return
+    }
+
+    try {
+        $content = Get-Content -Path $convPath -Raw
+        $conversations = @($content | ConvertFrom-Json)
+
+        for ($i = 0; $i -lt $conversations.Count; $i++) {
+            if ($conversations[$i].id -eq $EntryId) {
+                if ($Response) { $conversations[$i].response = $Response }
+                if ($Status) { $conversations[$i].status = $Status }
+                if ($ElapsedMinutes) { $conversations[$i].elapsedMinutes = $ElapsedMinutes }
+                if ($Error) { $conversations[$i].error = $Error }
+                $conversations[$i].completedAt = (Get-Date).ToString("o")
+                break
+            }
+        }
+
+        $json = $conversations | ConvertTo-Json -Depth 10
+        Set-Content -Path $tempPath -Value $json -Force
+        Move-Item -Path $tempPath -Destination $convPath -Force
+    } catch {
+        Write-RalphLog "Failed to update conversation entry: $_" -Level "ERROR"
+    }
+}
+
+# ============================================================================
 # CIRCUIT BREAKER
 # ============================================================================
 
@@ -1071,13 +1255,21 @@ function Test-CircuitBreaker {
 function Invoke-Claude {
     <#
     .SYNOPSIS
-        Invokes Claude CLI with rate limiting and retry logic
+        Invokes Claude CLI with rate limiting, retry logic, timeout, and conversation logging
     .PARAMETER Prompt
         The prompt to send to Claude
     .PARAMETER Model
         Model to use (from config if not specified)
     .PARAMETER MaxTurns
         Maximum turns for the conversation
+    .PARAMETER TimeoutMinutes
+        Timeout in minutes (from config if not specified)
+    .PARAMETER Iteration
+        Current iteration number (for logging)
+    .PARAMETER TaskId
+        Current task ID (for logging)
+    .PARAMETER TaskTitle
+        Current task title (for logging)
     #>
     [CmdletBinding()]
     param(
@@ -1087,6 +1279,14 @@ function Invoke-Claude {
         [string]$Model,
 
         [int]$MaxTurns,
+
+        [int]$TimeoutMinutes,
+
+        [int]$Iteration = 0,
+
+        [string]$TaskId = "unknown",
+
+        [string]$TaskTitle = "Unknown Task",
 
         [string]$ProjectPath = (Get-Location).Path
     )
@@ -1101,8 +1301,13 @@ function Invoke-Claude {
         $MaxTurns = $config.maxTurnsPerIteration
     }
 
+    if (-not $TimeoutMinutes -or $TimeoutMinutes -le 0) {
+        $TimeoutMinutes = if ($config.iterationTimeoutMinutes) { $config.iterationTimeoutMinutes } else { 15 }
+    }
+
     $retryCount = $config.rateLimiting.retryCount
     $cooldown = $config.rateLimiting.cooldownSeconds
+    $timeoutSeconds = $TimeoutMinutes * 60
 
     for ($attempt = 0; $attempt -le $retryCount; $attempt++) {
         # Check rate limit
@@ -1116,26 +1321,175 @@ function Invoke-Claude {
         Add-CallTimestamp -ProjectPath $ProjectPath
 
         try {
-            Write-RalphLog "Invoking Claude (attempt $($attempt + 1))..." -Level "DEBUG"
+            Write-RalphLog "Invoking Claude (attempt $($attempt + 1), timeout: ${TimeoutMinutes}m)..." -Level "DEBUG"
 
-            # Use --dangerously-skip-permissions to allow file operations without prompts
-            $result = claude -p $Prompt --model $Model --max-turns $MaxTurns --dangerously-skip-permissions --output-format json 2>&1
-            $output = $result | Out-String
+            # Update state with iteration start time
+            Update-RalphState -Updates @{
+                iterationStartTime = (Get-Date).ToString("o")
+                iterationStatus = "running"
+            } -ProjectPath $ProjectPath
 
-            Write-RalphLog "Claude response length: $($output.Length) chars" -Level "DEBUG"
+            # Create conversation log entry
+            $convEntryId = Add-ConversationEntry `
+                -Iteration $Iteration `
+                -TaskId $TaskId `
+                -TaskTitle $TaskTitle `
+                -Prompt $Prompt `
+                -Status "running" `
+                -ProjectPath $ProjectPath
+
+            # Write prompt to temp file to avoid command line length limits
+            $tempPromptFile = [System.IO.Path]::GetTempFileName()
+            Set-Content -Path $tempPromptFile -Value $Prompt -Encoding UTF8
+
+            # Use Start-Process with timeout for better control
+            $outputFile = [System.IO.Path]::GetTempFileName()
+            $errorFile = [System.IO.Path]::GetTempFileName()
+
+            $processArgs = "-p `"$tempPromptFile`" --model $Model --max-turns $MaxTurns --dangerously-skip-permissions --output-format json"
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "claude"
+            $psi.Arguments = "-p `"$(Get-Content $tempPromptFile -Raw)`" --model $Model --max-turns $MaxTurns --dangerously-skip-permissions --output-format json"
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.CreateNoWindow = $true
+            $psi.WorkingDirectory = $ProjectPath
+
+            $process = [System.Diagnostics.Process]::Start($psi)
+
+            # Poll for completion with timeout, updating state periodically
+            $startTime = Get-Date
+            $lastStatusUpdate = $startTime
+            $statusUpdateInterval = 30  # Update state every 30 seconds
+
+            while (-not $process.HasExited) {
+                $elapsed = (Get-Date) - $startTime
+                $elapsedMinutes = [math]::Round($elapsed.TotalMinutes, 1)
+
+                # Check timeout
+                if ($elapsed.TotalSeconds -ge $timeoutSeconds) {
+                    Write-RalphLog "Iteration timeout (${TimeoutMinutes}m) exceeded. Killing Claude process..." -Level "WARN"
+
+                    try {
+                        $process.Kill()
+                        $process.WaitForExit(5000)
+                    } catch {
+                        Write-RalphLog "Failed to kill process: $_" -Level "ERROR"
+                    }
+
+                    # Cleanup temp files
+                    Remove-Item $tempPromptFile -Force -ErrorAction SilentlyContinue
+
+                    Update-RalphState -Updates @{
+                        iterationStatus = "timeout"
+                        iterationElapsedMinutes = $elapsedMinutes
+                    } -ProjectPath $ProjectPath
+
+                    # Update conversation log with timeout
+                    if ($convEntryId) {
+                        Update-ConversationEntry `
+                            -EntryId $convEntryId `
+                            -Status "timeout" `
+                            -ElapsedMinutes $elapsedMinutes `
+                            -Error "Iteration timed out after $TimeoutMinutes minutes" `
+                            -ProjectPath $ProjectPath
+                    }
+
+                    return @{
+                        Success = $false
+                        Output = $null
+                        Error = "Iteration timed out after $TimeoutMinutes minutes"
+                        TimedOut = $true
+                    }
+                }
+
+                # Periodic status update
+                if (((Get-Date) - $lastStatusUpdate).TotalSeconds -ge $statusUpdateInterval) {
+                    Update-RalphState -Updates @{
+                        iterationElapsedMinutes = $elapsedMinutes
+                    } -ProjectPath $ProjectPath
+                    Write-RalphLog "Iteration in progress: ${elapsedMinutes}m elapsed (timeout: ${TimeoutMinutes}m)" -Level "INFO"
+                    $lastStatusUpdate = Get-Date
+                }
+
+                Start-Sleep -Milliseconds 500
+            }
+
+            # Process completed - read output
+            $output = $process.StandardOutput.ReadToEnd()
+            $stderr = $process.StandardError.ReadToEnd()
+
+            # Cleanup temp file
+            Remove-Item $tempPromptFile -Force -ErrorAction SilentlyContinue
+
+            $elapsedMinutes = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+
+            Update-RalphState -Updates @{
+                iterationStatus = "completed"
+                iterationElapsedMinutes = $elapsedMinutes
+            } -ProjectPath $ProjectPath
+
+            if ($process.ExitCode -ne 0) {
+                Write-RalphLog "Claude process exited with code $($process.ExitCode): $stderr" -Level "ERROR"
+
+                # Update conversation log with error
+                if ($convEntryId) {
+                    Update-ConversationEntry `
+                        -EntryId $convEntryId `
+                        -Response $output `
+                        -Status "error" `
+                        -ElapsedMinutes $elapsedMinutes `
+                        -Error "Claude exited with code $($process.ExitCode): $stderr" `
+                        -ProjectPath $ProjectPath
+                }
+
+                return @{
+                    Success = $false
+                    Output = $output
+                    Error = "Claude exited with code $($process.ExitCode): $stderr"
+                }
+            }
+
+            Write-RalphLog "Claude completed in ${elapsedMinutes}m, response length: $($output.Length) chars" -Level "DEBUG"
 
             # Log first part of response for debugging
             $preview = if ($output.Length -gt 200) { $output.Substring(0, 200) + "..." } else { $output }
             Write-RalphLog "Claude response preview: $preview" -Level "DEBUG"
 
+            # Update conversation log with successful response
+            if ($convEntryId) {
+                Update-ConversationEntry `
+                    -EntryId $convEntryId `
+                    -Response $output `
+                    -Status "completed" `
+                    -ElapsedMinutes $elapsedMinutes `
+                    -ProjectPath $ProjectPath
+            }
+
             return @{
                 Success = $true
                 Output = $output
                 Error = $null
+                ElapsedMinutes = $elapsedMinutes
             }
         } catch {
             $errorMsg = $_.Exception.Message
             Write-RalphLog "Claude invocation failed: $errorMsg" -Level "ERROR"
+
+            Update-RalphState -Updates @{
+                iterationStatus = "error"
+            } -ProjectPath $ProjectPath
+
+            # Update conversation log with error (if entry was created)
+            if ($convEntryId) {
+                Update-ConversationEntry `
+                    -EntryId $convEntryId `
+                    -Status "error" `
+                    -Error $errorMsg `
+                    -ProjectPath $ProjectPath
+            }
 
             if ($attempt -lt $retryCount) {
                 Write-RalphLog "Retrying in $cooldown seconds..." -Level "WARN"
@@ -1209,6 +1563,11 @@ if ($MyInvocation.MyCommand.ScriptBlock.Module) {
 
         # Circuit breaker
         'Test-CircuitBreaker',
+
+        # Conversation logging
+        'Get-ConversationLog',
+        'Add-ConversationEntry',
+        'Update-ConversationEntry',
 
         # Claude CLI
         'Invoke-Claude'

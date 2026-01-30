@@ -34,12 +34,54 @@ Write-Host ""
 # Check if already running
 try {
     $response = Invoke-RestMethod -Uri "http://localhost:$Port/api/health" -TimeoutSec 2
-    Write-Host "Monitor already running on port $Port" -ForegroundColor Yellow
+    Write-Host "Monitor API already running on port $Port" -ForegroundColor Yellow
     Write-Host "  Projects: $($response.projectCount)" -ForegroundColor Cyan
     Write-Host "  Uptime: $([math]::Round($response.uptime, 0)) seconds" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Check if Vite dev server is running
+    $viteRunning = $false
+    try {
+        $null = Invoke-WebRequest -Uri "http://localhost:5173" -TimeoutSec 2 -ErrorAction Stop
+        $viteRunning = $true
+    } catch {
+        # Vite not running
+    }
+
+    if ($viteRunning) {
+        Write-Host "Dashboard already running at http://localhost:5173" -ForegroundColor Green
+        if (-not $NoBrowser) {
+            Start-Process "http://localhost:5173"
+        }
+        return
+    }
+
+    # Start Vite dev server since it's not running
+    Write-Host "Starting dashboard dev server..." -ForegroundColor Cyan
+    Push-Location $DashboardDir
+    try {
+        $viteProcess = Start-Process -FilePath "npm" -ArgumentList "run", "dev" -PassThru -NoNewWindow
+    } finally {
+        Pop-Location
+    }
+
+    Start-Sleep -Seconds 3
 
     if (-not $NoBrowser) {
         Start-Process "http://localhost:5173"
+    }
+
+    Write-Host ""
+    Write-Host "Dashboard: http://localhost:5173" -ForegroundColor Green
+    Write-Host "API: http://localhost:$Port" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Press Ctrl+C to stop the dashboard." -ForegroundColor Yellow
+
+    # Keep script running while Vite runs
+    try {
+        $viteProcess.WaitForExit()
+    } catch {
+        # Ctrl+C
     }
     return
 } catch {

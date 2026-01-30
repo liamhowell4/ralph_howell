@@ -90,3 +90,12 @@ export async function fetchFileChanges(port) {
   if (!res.ok) throw new Error('Failed to fetch changes');
   return res.json();
 }
+
+/**
+ * Fetch conversation log
+ */
+export async function fetchConversations(port, limit = 10) {
+  const res = await fetch(`${MONITOR_URL}/projects/${port}/conversations?limit=${limit}`);
+  if (!res.ok) throw new Error('Failed to fetch conversations');
+  return res.json();
+}

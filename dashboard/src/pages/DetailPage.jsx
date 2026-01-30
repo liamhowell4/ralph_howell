@@ -9,6 +9,7 @@ import CircuitBreaker from '../components/CircuitBreaker';
 import LogViewer from '../components/LogViewer';
 import FileChanges from '../components/FileChanges';
 import ConfigEditor from '../components/ConfigEditor';
+import ConversationLog from '../components/ConversationLog';
 
 function DetailPage() {
   const { port } = useParams();
@@ -21,6 +22,7 @@ function DetailPage() {
     logs,
     rateLimit,
     changes,
+    conversations,
     loading,
     error,
     refresh
@@ -113,7 +115,7 @@ function DetailPage() {
 
       {/* Status Row */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-        <StatusPanel state={state} />
+        <StatusPanel state={state} config={config} />
         <UsageMeter rateLimit={rateLimit} />
         <CircuitBreaker state={state} config={config} />
       </div>
@@ -121,6 +123,11 @@ function DetailPage() {
       {/* Task Progress */}
       <div className="mb-6">
         <TaskProgress prd={prd} />
+      </div>
+
+      {/* Conversation Log */}
+      <div className="mb-6">
+        <ConversationLog conversations={conversations} />
       </div>
 
       {/* Bottom Row */}
