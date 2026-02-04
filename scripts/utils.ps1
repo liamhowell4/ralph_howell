@@ -12,6 +12,7 @@
 # ============================================================================
 
 $script:DefaultConfig = @{
+    engine = "claude"  # "claude" or "codex"
     model = "claude-opus-4-5-20251101"
     maxIterations = 50
     maxTurnsPerIteration = 50
@@ -25,6 +26,8 @@ $script:DefaultConfig = @{
         maxNoChangeIterations = 3
         maxSameErrorIterations = 5
         maxTotalMinutes = 480
+        maxTaskTimeouts = 3          # Max timeouts per task before circuit break (original + 2 extensions)
+        timeoutExtensionMinutes = 5  # Additional minutes per retry after timeout
     }
     git = @{
         autoCommit = $true
@@ -193,6 +196,7 @@ function Initialize-RalphDirectory {
             currentTaskIndex = 0
             startTime = (Get-Date).ToString("o")
             lastUpdateTime = (Get-Date).ToString("o")
+            totalActiveMinutes = 0  # Cumulative runtime excluding paused time
             apiPort = $null
             errors = @()
             noChangeCount = 0
@@ -200,6 +204,7 @@ function Initialize-RalphDirectory {
             lastError = $null
             filesChanged = @()
             testResults = $null
+            taskTimeouts = @{}  # Track timeout count per task (taskId -> count)
         }
         Save-RalphState -State $initialState -ProjectPath $ProjectPath
     }
@@ -461,18 +466,30 @@ function ConvertFrom-MarkdownPrd {
         Transforms a markdown PRD into structured JSON format
     .PARAMETER MarkdownPath
         Path to the markdown file
+    .PARAMETER Engine
+        Override engine selection ("claude", "codex", or "opencode")
     .DESCRIPTION
-        Uses Claude to transform a markdown PRD into the structured JSON format
+        Uses the configured engine (Claude, Codex, or OpenCode) to transform a markdown PRD
+        into the structured JSON format
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$MarkdownPath
+        [string]$MarkdownPath,
+
+        [ValidateSet("claude", "codex", "opencode")]
+        [string]$Engine
     )
 
     if (-not (Test-Path $MarkdownPath)) {
         Write-RalphLog "Markdown file not found: $MarkdownPath" -Level "ERROR"
         return $null
+    }
+
+    $config = Get-RalphConfig
+    $selectedEngine = if ($Engine) { $Engine } else { $config.engine }
+    if (-not $selectedEngine) {
+        $selectedEngine = "claude"
     }
 
     $mdContent = Get-Content -Path $MarkdownPath -Raw
@@ -481,28 +498,51 @@ function ConvertFrom-MarkdownPrd {
 You are a JSON generator. Your ONLY output must be valid JSON - no explanations, no markdown, no text before or after.
 
 Convert this PRD to JSON with this structure:
-{"projectName":"string","description":"string","tasks":[{"id":1,"title":"string","description":"string","status":"pending","acceptanceCriteria":["string"],"dependencies":[]}]}
+{
+  "projectName": "string",
+  "description": "string",
+  "tasks": [
+    {
+      "id": 1,
+      "title": "string",
+      "description": "string",
+      "status": "pending",
+      "acceptanceCriteria": ["string"],
+      "dependencies": []
+    }
+  ],
+  "dependencyGraph": {
+    "nodes": [1, 2, 3],
+    "edges": [{"from": 1, "to": 2}]
+  }
+}
 
 Rules:
 - Extract ALL tasks from the Task Checklist section
-- Each checkbox item becomes a task
+- Each checkbox item becomes a task with sequential IDs starting at 1
 - Set all statuses to "pending"
+- IMPORTANT: Parse task dependencies from the PRD content:
+  - Look for patterns like "depends on task N", "after task N", "requires task N"
+  - Look for bracket notation like [depends: 1, 3] or [after: 2]
+  - Look for natural language like "once X is complete" or "after implementing Y"
+  - Populate the "dependencies" array with task IDs that must complete first
+- Build the dependencyGraph object:
+  - "nodes" is an array of all task IDs
+  - "edges" is an array of {from, to} where "from" is the dependency and "to" is the dependent task
+- If no dependencies are found for a task, use an empty array []
 - Output ONLY the JSON object, nothing else
 
 PRD content:
 $mdContent
 "@
 
-    Write-RalphLog "Transforming markdown PRD with Claude..." -Level "INFO"
+    Write-RalphLog "Transforming markdown PRD with $selectedEngine..." -Level "INFO"
 
     try {
-        $result = claude -p $transformPrompt --output-format json 2>&1
+        $jsonContent = Invoke-EngineSimple -Prompt $transformPrompt -Engine $selectedEngine
 
-        # Parse the JSON response from Claude CLI
-        $jsonContent = $result | Out-String
-
-        # Claude CLI with --output-format json returns: {"type":"result","result":"...content..."}
-        # The actual response is in the .result property as a string
+        # For Claude CLI with --output-format json: {"type":"result","result":"...content..."}
+        # For Codex: JSONL format already parsed by Invoke-EngineSimple
         $cliResponse = $null
         try {
             $cliResponse = $jsonContent | ConvertFrom-Json
@@ -512,7 +552,7 @@ $mdContent
 
         $prdContent = $null
         if ($cliResponse -and $cliResponse.type -eq "result" -and $cliResponse.result) {
-            # Extract the actual content from the CLI wrapper
+            # Extract the actual content from the CLI wrapper (Claude format)
             $prdContent = $cliResponse.result
             Write-RalphLog "Extracted result from CLI wrapper (length: $($prdContent.Length))" -Level "DEBUG"
         } else {
@@ -539,6 +579,53 @@ $mdContent
         }
 
         Write-RalphLog "Transformed PRD: $($prd.tasks.Count) tasks extracted" -Level "INFO"
+
+        # Validate dependencies
+        $hasDependencies = $false
+        foreach ($task in $prd.tasks) {
+            if ($task.dependencies -and $task.dependencies.Count -gt 0) {
+                $hasDependencies = $true
+                break
+            }
+        }
+
+        if ($hasDependencies) {
+            Write-RalphLog "Validating task dependencies..." -Level "INFO"
+
+            # Validate dependency references
+            $validation = Test-DependencyValidation -Prd $prd
+            if (-not $validation.Valid) {
+                foreach ($error in $validation.Errors) {
+                    Write-RalphLog "Dependency error: $error" -Level "ERROR"
+                }
+                Write-RalphLog "PRD transformation failed dependency validation" -Level "ERROR"
+                return $null
+            }
+
+            # Check for circular dependencies
+            $cycleCheck = Test-CircularDependencies -Prd $prd
+            if ($cycleCheck.HasCycle) {
+                $cyclePath = $cycleCheck.CyclePath -join " -> "
+                Write-RalphLog "Circular dependency detected: $cyclePath" -Level "ERROR"
+                return $null
+            }
+
+            Write-RalphLog "Dependency validation passed" -Level "INFO"
+        }
+
+        # Build dependency graph if not provided by LLM
+        if (-not $prd.dependencyGraph) {
+            $prd | Add-Member -NotePropertyName 'dependencyGraph' -NotePropertyValue (Build-DependencyGraph -Prd $prd) -Force
+            Write-RalphLog "Built dependency graph" -Level "DEBUG"
+        }
+
+        # Add metadata
+        if (-not $prd.metadata) {
+            $prd | Add-Member -NotePropertyName 'metadata' -NotePropertyValue @{} -Force
+        }
+        $prd.metadata | Add-Member -NotePropertyName 'hasDependencies' -NotePropertyValue $hasDependencies -Force
+        $prd.metadata | Add-Member -NotePropertyName 'validatedAt' -NotePropertyValue (Get-Date).ToString("o") -Force
+
         return $prd
     } catch {
         Write-RalphLog "Failed to transform markdown PRD: $_" -Level "ERROR"
@@ -549,6 +636,354 @@ $mdContent
         }
         return $null
     }
+}
+
+# ============================================================================
+# DEPENDENCY MANAGEMENT
+# ============================================================================
+
+function Test-DependencyValidation {
+    <#
+    .SYNOPSIS
+        Validates that all dependency references are valid
+    .PARAMETER Prd
+        The PRD object with tasks
+    .OUTPUTS
+        Hashtable with:
+        - Valid: boolean
+        - Errors: array of error messages
+    .DESCRIPTION
+        Validates:
+        1. All referenced task IDs exist
+        2. Subtasks can only depend on siblings within the same parent
+        3. No self-references
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Prd
+    )
+
+    $result = @{
+        Valid = $true
+        Errors = @()
+    }
+
+    if (-not $Prd.tasks) {
+        return $result
+    }
+
+    # Build map of task IDs for quick lookup
+    $taskIds = @{}
+    $taskParents = @{}  # Track parent of each subtask
+
+    foreach ($task in $Prd.tasks) {
+        $taskIds[$task.id] = $task
+
+        # Check for subtasks
+        if ($task.subtasks) {
+            foreach ($subtask in $task.subtasks) {
+                $taskIds[$subtask.id] = $subtask
+                $taskParents[$subtask.id] = $task.id
+            }
+        }
+    }
+
+    # Validate each task's dependencies
+    foreach ($task in $Prd.tasks) {
+        $tasksToCheck = @($task)
+        if ($task.subtasks) {
+            $tasksToCheck += $task.subtasks
+        }
+
+        foreach ($t in $tasksToCheck) {
+            if (-not $t.dependencies) { continue }
+
+            foreach ($depId in $t.dependencies) {
+                # Check for self-reference
+                if ($depId -eq $t.id) {
+                    $result.Valid = $false
+                    $result.Errors += "Task $($t.id) cannot depend on itself"
+                    continue
+                }
+
+                # Check if referenced task exists
+                if (-not $taskIds.ContainsKey($depId)) {
+                    $result.Valid = $false
+                    $result.Errors += "Task $($t.id) depends on non-existent task $depId"
+                    continue
+                }
+
+                # Check subtask scoping: subtasks can only depend on siblings
+                $taskParent = $taskParents[$t.id]
+                $depParent = $taskParents[$depId]
+
+                if ($taskParent -and $depParent) {
+                    # Both are subtasks - must have same parent
+                    if ($taskParent -ne $depParent) {
+                        $result.Valid = $false
+                        $result.Errors += "Subtask $($t.id) cannot depend on subtask $depId from different parent task"
+                    }
+                } elseif ($taskParent -and -not $depParent) {
+                    # Subtask depending on top-level task is OK (can depend on parent or other top-level)
+                } elseif (-not $taskParent -and $depParent) {
+                    # Top-level task depending on subtask
+                    $result.Valid = $false
+                    $result.Errors += "Top-level task $($t.id) cannot depend on subtask $depId"
+                }
+            }
+        }
+    }
+
+    return $result
+}
+
+function Test-CircularDependencies {
+    <#
+    .SYNOPSIS
+        Detects circular dependencies using DFS
+    .PARAMETER Prd
+        The PRD object with tasks
+    .OUTPUTS
+        Hashtable with:
+        - HasCycle: boolean
+        - CyclePath: array showing the cycle (if found)
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Prd
+    )
+
+    $result = @{
+        HasCycle = $false
+        CyclePath = @()
+    }
+
+    if (-not $Prd.tasks) {
+        return $result
+    }
+
+    # Build adjacency list (task -> tasks it depends on)
+    $dependencies = @{}
+
+    foreach ($task in $Prd.tasks) {
+        if ($task.dependencies) {
+            $dependencies[$task.id] = @($task.dependencies)
+        } else {
+            $dependencies[$task.id] = @()
+        }
+
+        # Include subtasks
+        if ($task.subtasks) {
+            foreach ($subtask in $task.subtasks) {
+                if ($subtask.dependencies) {
+                    $dependencies[$subtask.id] = @($subtask.dependencies)
+                } else {
+                    $dependencies[$subtask.id] = @()
+                }
+            }
+        }
+    }
+
+    # Iterative DFS cycle detection using explicit stack
+    $visited = @{}
+    $recursionStack = @{}
+
+    foreach ($startTaskId in $dependencies.Keys) {
+        if ($visited[$startTaskId]) { continue }
+
+        # Stack entries: @{ TaskId; DepIndex; Path }
+        $stack = [System.Collections.ArrayList]@()
+        $stack.Add(@{ TaskId = $startTaskId; DepIndex = 0; Path = @($startTaskId) }) | Out-Null
+        $recursionStack[$startTaskId] = $true
+
+        while ($stack.Count -gt 0) {
+            $current = $stack[$stack.Count - 1]
+            $taskId = $current.TaskId
+            $depIndex = $current.DepIndex
+            $currentPath = $current.Path
+
+            $deps = $dependencies[$taskId]
+            if (-not $deps) { $deps = @() }
+
+            if ($depIndex -ge $deps.Count) {
+                # Done with this node - backtrack
+                $stack.RemoveAt($stack.Count - 1)
+                $recursionStack[$taskId] = $false
+                $visited[$taskId] = $true
+                continue
+            }
+
+            # Process next dependency
+            $depId = $deps[$depIndex]
+            $current.DepIndex = $depIndex + 1
+
+            if ($recursionStack[$depId]) {
+                # Found cycle
+                $cycleStart = [array]::IndexOf($currentPath, $depId)
+                if ($cycleStart -ge 0) {
+                    $result.CyclePath = @($currentPath[$cycleStart..($currentPath.Count - 1)]) + @($depId)
+                } else {
+                    $result.CyclePath = @($currentPath) + @($depId)
+                }
+                $result.HasCycle = $true
+                return $result
+            }
+
+            if (-not $visited[$depId] -and $dependencies.ContainsKey($depId)) {
+                # Push new node to stack
+                $recursionStack[$depId] = $true
+                $newPath = @($currentPath) + @($depId)
+                $stack.Add(@{ TaskId = $depId; DepIndex = 0; Path = $newPath }) | Out-Null
+            }
+        }
+    }
+
+    return $result
+}
+
+function Build-DependencyGraph {
+    <#
+    .SYNOPSIS
+        Builds a dependency graph structure from task dependencies
+    .PARAMETER Prd
+        The PRD object with tasks
+    .OUTPUTS
+        Hashtable representing the dependency graph:
+        - nodes: array of task IDs
+        - edges: array of {from, to} objects
+        - adjacencyList: hashtable of taskId -> dependents (tasks that depend on this one)
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Prd
+    )
+
+    $graph = @{
+        nodes = @()
+        edges = @()
+        adjacencyList = @{}
+    }
+
+    if (-not $Prd.tasks) {
+        return $graph
+    }
+
+    # Collect all task IDs
+    foreach ($task in $Prd.tasks) {
+        $graph.nodes += $task.id
+        $graph.adjacencyList[$task.id] = @()
+
+        if ($task.subtasks) {
+            foreach ($subtask in $task.subtasks) {
+                $graph.nodes += $subtask.id
+                $graph.adjacencyList[$subtask.id] = @()
+            }
+        }
+    }
+
+    # Build edges and adjacency list
+    foreach ($task in $Prd.tasks) {
+        $tasksToProcess = @($task)
+        if ($task.subtasks) {
+            $tasksToProcess += $task.subtasks
+        }
+
+        foreach ($t in $tasksToProcess) {
+            if ($t.dependencies) {
+                foreach ($depId in $t.dependencies) {
+                    # Edge goes from dependency to dependent
+                    $graph.edges += @{ from = $depId; to = $t.id }
+
+                    # Add to adjacency list (what tasks depend on this one)
+                    if ($graph.adjacencyList.ContainsKey($depId)) {
+                        $graph.adjacencyList[$depId] += $t.id
+                    }
+                }
+            }
+        }
+    }
+
+    return $graph
+}
+
+function Get-NextAvailableTask {
+    <#
+    .SYNOPSIS
+        Returns the next task that has all dependencies satisfied
+    .PARAMETER Prd
+        The PRD object with tasks
+    .OUTPUTS
+        The next available task, or $null if none available
+    .DESCRIPTION
+        A task is available if:
+        1. Its status is "pending" or "in_progress"
+        2. All tasks in its dependencies array have status "completed"
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Prd
+    )
+
+    if (-not $Prd.tasks) {
+        return $null
+    }
+
+    # Build map of task IDs to status
+    $taskStatus = @{}
+    foreach ($task in $Prd.tasks) {
+        $taskStatus[$task.id] = $task.status
+
+        if ($task.subtasks) {
+            foreach ($subtask in $task.subtasks) {
+                $taskStatus[$subtask.id] = $subtask.status
+            }
+        }
+    }
+
+    # Find first available task (pending/in_progress with all deps completed)
+    foreach ($task in $Prd.tasks) {
+        # Check top-level task
+        if ($task.status -eq "pending" -or $task.status -eq "in_progress") {
+            $depsOk = $true
+            if ($task.dependencies) {
+                foreach ($depId in $task.dependencies) {
+                    if ($taskStatus[$depId] -ne "completed") {
+                        $depsOk = $false
+                        break
+                    }
+                }
+            }
+            if ($depsOk) {
+                return $task
+            }
+        }
+
+        # Check subtasks
+        if ($task.subtasks) {
+            foreach ($subtask in $task.subtasks) {
+                if ($subtask.status -eq "pending" -or $subtask.status -eq "in_progress") {
+                    $depsOk = $true
+                    if ($subtask.dependencies) {
+                        foreach ($depId in $subtask.dependencies) {
+                            if ($taskStatus[$depId] -ne "completed") {
+                                $depsOk = $false
+                                break
+                            }
+                        }
+                    }
+                    if ($depsOk) {
+                        return $subtask
+                    }
+                }
+            }
+        }
+    }
+
+    return $null
 }
 
 function Update-TaskStatus {
@@ -794,14 +1229,20 @@ function Find-AvailablePort {
     $maxPort = $StartPort + 100
 
     while ($port -lt $maxPort) {
-        try {
-            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
-            $listener.Start()
-            $listener.Stop()
-            return $port
-        } catch {
-            $port++
+        # Check if port is in use using netstat (works for all interfaces including IPv6)
+        $inUse = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+        if (-not $inUse) {
+            # Double-check by trying to bind
+            try {
+                $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $port)
+                $listener.Start()
+                $listener.Stop()
+                return $port
+            } catch {
+                # Port became unavailable, try next
+            }
         }
+        $port++
     }
 
     Write-RalphLog "No available ports found in range $StartPort-$maxPort" -Level "ERROR"
@@ -1171,11 +1612,21 @@ function Update-ConversationEntry {
 
         for ($i = 0; $i -lt $conversations.Count; $i++) {
             if ($conversations[$i].id -eq $EntryId) {
-                if ($Response) { $conversations[$i].response = $Response }
-                if ($Status) { $conversations[$i].status = $Status }
-                if ($ElapsedMinutes) { $conversations[$i].elapsedMinutes = $ElapsedMinutes }
-                if ($Error) { $conversations[$i].error = $Error }
-                $conversations[$i].completedAt = (Get-Date).ToString("o")
+                # Use Add-Member -Force to handle PSCustomObjects from ConvertFrom-Json
+                # which may not have all properties if they were null when saved
+                if ($Response) {
+                    $conversations[$i] | Add-Member -NotePropertyName 'response' -NotePropertyValue $Response -Force
+                }
+                if ($Status) {
+                    $conversations[$i] | Add-Member -NotePropertyName 'status' -NotePropertyValue $Status -Force
+                }
+                if ($ElapsedMinutes) {
+                    $conversations[$i] | Add-Member -NotePropertyName 'elapsedMinutes' -NotePropertyValue $ElapsedMinutes -Force
+                }
+                if ($Error) {
+                    $conversations[$i] | Add-Member -NotePropertyName 'error' -NotePropertyValue $Error -Force
+                }
+                $conversations[$i] | Add-Member -NotePropertyName 'completedAt' -NotePropertyValue (Get-Date).ToString("o") -Force
                 break
             }
         }
@@ -1234,15 +1685,179 @@ function Test-CircuitBreaker {
         return $result
     }
 
-    # Check total runtime
+    # Check total runtime (cumulative active time, not wall clock time)
     if ($state.startTime) {
         $startTime = [datetime]$state.startTime
-        $runtime = ((Get-Date) - $startTime).TotalMinutes
-        if ($runtime -ge $cb.maxTotalMinutes) {
+        $currentSessionMinutes = ((Get-Date) - $startTime).TotalMinutes
+        $previousMinutes = if ($state.totalActiveMinutes) { $state.totalActiveMinutes } else { 0 }
+        $totalRuntime = $previousMinutes + $currentSessionMinutes
+        if ($totalRuntime -ge $cb.maxTotalMinutes) {
             $result.Triggered = $true
-            $result.Reason = "Maximum runtime of $($cb.maxTotalMinutes) minutes exceeded"
+            $result.Reason = "Maximum runtime of $($cb.maxTotalMinutes) minutes exceeded (total: $([math]::Round($totalRuntime, 1)) min)"
             return $result
         }
+    }
+
+    return $result
+}
+
+function Get-TaskTimeoutCount {
+    <#
+    .SYNOPSIS
+        Gets the timeout count for a specific task
+    .PARAMETER TaskId
+        The task ID to check
+    .PARAMETER ProjectPath
+        Project path for state lookup
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskId,
+
+        [string]$ProjectPath = (Get-Location).Path
+    )
+
+    $state = Get-RalphState -ProjectPath $ProjectPath
+    if (-not $state -or -not $state.taskTimeouts) {
+        return 0
+    }
+
+    # Handle both hashtable and PSCustomObject (from JSON deserialization)
+    if ($state.taskTimeouts -is [hashtable]) {
+        return if ($state.taskTimeouts.ContainsKey($TaskId)) { $state.taskTimeouts[$TaskId] } else { 0 }
+    } else {
+        # PSCustomObject from JSON
+        $value = $state.taskTimeouts.PSObject.Properties[$TaskId]
+        return if ($value) { $value.Value } else { 0 }
+    }
+}
+
+function Add-TaskTimeout {
+    <#
+    .SYNOPSIS
+        Increments the timeout count for a specific task
+    .PARAMETER TaskId
+        The task ID that timed out
+    .PARAMETER ProjectPath
+        Project path for state lookup
+    .OUTPUTS
+        The new timeout count for this task
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskId,
+
+        [string]$ProjectPath = (Get-Location).Path
+    )
+
+    $state = Get-RalphState -ProjectPath $ProjectPath
+    if (-not $state) {
+        return 1
+    }
+
+    # Get current taskTimeouts, handling both hashtable and PSCustomObject
+    $taskTimeouts = @{}
+    if ($state.taskTimeouts) {
+        if ($state.taskTimeouts -is [hashtable]) {
+            $taskTimeouts = $state.taskTimeouts.Clone()
+        } else {
+            # Convert PSCustomObject to hashtable
+            foreach ($prop in $state.taskTimeouts.PSObject.Properties) {
+                $taskTimeouts[$prop.Name] = $prop.Value
+            }
+        }
+    }
+
+    # Increment count
+    $currentCount = if ($taskTimeouts.ContainsKey($TaskId)) { $taskTimeouts[$TaskId] } else { 0 }
+    $newCount = $currentCount + 1
+    $taskTimeouts[$TaskId] = $newCount
+
+    Update-RalphState -Updates @{ taskTimeouts = $taskTimeouts } -ProjectPath $ProjectPath
+    return $newCount
+}
+
+function Get-EffectiveTimeout {
+    <#
+    .SYNOPSIS
+        Calculates the effective timeout for a task based on previous timeout history
+    .DESCRIPTION
+        If a task has timed out before, extends the timeout by timeoutExtensionMinutes
+        for each previous timeout (up to maxTaskTimeouts - 1 extensions)
+    .PARAMETER TaskId
+        The task ID to calculate timeout for
+    .PARAMETER ProjectPath
+        Project path for config/state lookup
+    .OUTPUTS
+        Hashtable with:
+        - TimeoutMinutes: effective timeout in minutes
+        - ExtensionCount: number of extensions applied
+        - BaseTimeout: the base timeout from config
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskId,
+
+        [string]$ProjectPath = (Get-Location).Path
+    )
+
+    $config = Get-RalphConfig -ProjectPath $ProjectPath
+    $baseTimeout = if ($config.iterationTimeoutMinutes) { $config.iterationTimeoutMinutes } else { 15 }
+    $extensionMinutes = if ($config.circuitBreaker.timeoutExtensionMinutes) { $config.circuitBreaker.timeoutExtensionMinutes } else { 5 }
+    $maxTimeouts = if ($config.circuitBreaker.maxTaskTimeouts) { $config.circuitBreaker.maxTaskTimeouts } else { 3 }
+
+    $timeoutCount = Get-TaskTimeoutCount -TaskId $TaskId -ProjectPath $ProjectPath
+
+    # Max extensions is maxTaskTimeouts - 1 (original attempt + extensions)
+    $extensionCount = [math]::Min($timeoutCount, $maxTimeouts - 1)
+    $effectiveTimeout = $baseTimeout + ($extensionCount * $extensionMinutes)
+
+    return @{
+        TimeoutMinutes = $effectiveTimeout
+        ExtensionCount = $extensionCount
+        BaseTimeout = $baseTimeout
+        PreviousTimeouts = $timeoutCount
+    }
+}
+
+function Test-TaskTimeoutCircuitBreaker {
+    <#
+    .SYNOPSIS
+        Checks if a task has exceeded its maximum timeout retries
+    .PARAMETER TaskId
+        The task ID to check
+    .PARAMETER ProjectPath
+        Project path for config/state lookup
+    .OUTPUTS
+        Hashtable with:
+        - Triggered: boolean
+        - Reason: string explaining why (if triggered)
+        - TimeoutCount: current timeout count
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskId,
+
+        [string]$ProjectPath = (Get-Location).Path
+    )
+
+    $config = Get-RalphConfig -ProjectPath $ProjectPath
+    $maxTimeouts = if ($config.circuitBreaker.maxTaskTimeouts) { $config.circuitBreaker.maxTaskTimeouts } else { 3 }
+    $timeoutCount = Get-TaskTimeoutCount -TaskId $TaskId -ProjectPath $ProjectPath
+
+    $result = @{
+        Triggered = $false
+        Reason = $null
+        TimeoutCount = $timeoutCount
+    }
+
+    if ($timeoutCount -ge $maxTimeouts) {
+        $result.Triggered = $true
+        $result.Reason = "Task '$TaskId' timed out $timeoutCount times (max: $maxTimeouts)"
     }
 
     return $result
@@ -1506,6 +2121,741 @@ function Invoke-Claude {
 }
 
 # ============================================================================
+# CODEX CLI WRAPPER
+# ============================================================================
+
+function Invoke-Codex {
+    <#
+    .SYNOPSIS
+        Invokes Codex CLI with rate limiting, retry logic, timeout, and conversation logging
+    .PARAMETER Prompt
+        The prompt to send to Codex
+    .PARAMETER TimeoutMinutes
+        Timeout in minutes (from config if not specified)
+    .PARAMETER Iteration
+        Current iteration number (for logging)
+    .PARAMETER TaskId
+        Current task ID (for logging)
+    .PARAMETER TaskTitle
+        Current task title (for logging)
+    .DESCRIPTION
+        Codex CLI differences from Claude CLI:
+        - Command: codex exec "prompt" (not claude -p)
+        - Permissions bypass: --dangerously-bypass-approvals-and-sandbox
+        - JSON output: --json (returns JSONL format)
+        - No --model flag (handled by global config)
+        - No --max-turns flag
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [int]$TimeoutMinutes,
+
+        [int]$Iteration = 0,
+
+        [string]$TaskId = "unknown",
+
+        [string]$TaskTitle = "Unknown Task",
+
+        [string]$ProjectPath = (Get-Location).Path
+    )
+
+    $config = Get-RalphConfig -ProjectPath $ProjectPath
+
+    if (-not $TimeoutMinutes -or $TimeoutMinutes -le 0) {
+        $TimeoutMinutes = if ($config.iterationTimeoutMinutes) { $config.iterationTimeoutMinutes } else { 15 }
+    }
+
+    $retryCount = $config.rateLimiting.retryCount
+    $cooldown = $config.rateLimiting.cooldownSeconds
+    $timeoutSeconds = $TimeoutMinutes * 60
+
+    for ($attempt = 0; $attempt -le $retryCount; $attempt++) {
+        # Check rate limit
+        $rateCheck = Test-RateLimitOk -ProjectPath $ProjectPath
+        if (-not $rateCheck.Ok) {
+            Write-RalphLog "Rate limit reached. Waiting $($rateCheck.WaitSeconds) seconds..." -Level "WARN"
+            Start-Sleep -Seconds $rateCheck.WaitSeconds
+        }
+
+        # Record call timestamp
+        Add-CallTimestamp -ProjectPath $ProjectPath
+
+        try {
+            Write-RalphLog "Invoking Codex (attempt $($attempt + 1), timeout: ${TimeoutMinutes}m)..." -Level "DEBUG"
+
+            # Update state with iteration start time
+            Update-RalphState -Updates @{
+                iterationStartTime = (Get-Date).ToString("o")
+                iterationStatus = "running"
+            } -ProjectPath $ProjectPath
+
+            # Create conversation log entry
+            $convEntryId = Add-ConversationEntry `
+                -Iteration $Iteration `
+                -TaskId $TaskId `
+                -TaskTitle $TaskTitle `
+                -Prompt $Prompt `
+                -Status "running" `
+                -ProjectPath $ProjectPath
+
+            # Write prompt to temp file for stdin
+            $tempPromptFile = [System.IO.Path]::GetTempFileName()
+            $tempStdoutFile = [System.IO.Path]::GetTempFileName()
+            $tempStderrFile = [System.IO.Path]::GetTempFileName()
+            Set-Content -Path $tempPromptFile -Value $Prompt -Encoding UTF8
+
+            # Get model from config if available
+            $codexModel = $config.codexModel
+
+            # Build codex command - use stdin via "-" argument
+            $codexCmd = if ($codexModel) {
+                "Get-Content '$tempPromptFile' -Raw | codex exec - -m '$codexModel' --dangerously-bypass-approvals-and-sandbox --json"
+            } else {
+                "Get-Content '$tempPromptFile' -Raw | codex exec - --dangerously-bypass-approvals-and-sandbox --json"
+            }
+
+            # Use Start-Process with powershell.exe to properly handle the script wrapper
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "powershell.exe"
+            $psi.Arguments = "-NoProfile -NonInteractive -Command `"$codexCmd`""
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.CreateNoWindow = $true
+            $psi.WorkingDirectory = $ProjectPath
+
+            $process = [System.Diagnostics.Process]::Start($psi)
+
+            # Poll for completion with timeout, updating state periodically
+            $startTime = Get-Date
+            $lastStatusUpdate = $startTime
+            $statusUpdateInterval = 30  # Update state every 30 seconds
+
+            while (-not $process.HasExited) {
+                $elapsed = (Get-Date) - $startTime
+                $elapsedMinutes = [math]::Round($elapsed.TotalMinutes, 1)
+
+                # Check timeout
+                if ($elapsed.TotalSeconds -ge $timeoutSeconds) {
+                    Write-RalphLog "Iteration timeout (${TimeoutMinutes}m) exceeded. Killing Codex process..." -Level "WARN"
+
+                    try {
+                        $process.Kill()
+                        $process.WaitForExit(5000)
+                    } catch {
+                        Write-RalphLog "Failed to kill process: $_" -Level "ERROR"
+                    }
+
+                    # Cleanup temp files
+                    Remove-Item $tempPromptFile -Force -ErrorAction SilentlyContinue
+                    Remove-Item $tempStdoutFile -Force -ErrorAction SilentlyContinue
+                    Remove-Item $tempStderrFile -Force -ErrorAction SilentlyContinue
+
+                    Update-RalphState -Updates @{
+                        iterationStatus = "timeout"
+                        iterationElapsedMinutes = $elapsedMinutes
+                    } -ProjectPath $ProjectPath
+
+                    # Update conversation log with timeout
+                    if ($convEntryId) {
+                        Update-ConversationEntry `
+                            -EntryId $convEntryId `
+                            -Status "timeout" `
+                            -ElapsedMinutes $elapsedMinutes `
+                            -Error "Iteration timed out after $TimeoutMinutes minutes" `
+                            -ProjectPath $ProjectPath
+                    }
+
+                    return @{
+                        Success = $false
+                        Output = $null
+                        Error = "Iteration timed out after $TimeoutMinutes minutes"
+                        TimedOut = $true
+                    }
+                }
+
+                # Periodic status update
+                if (((Get-Date) - $lastStatusUpdate).TotalSeconds -ge $statusUpdateInterval) {
+                    Update-RalphState -Updates @{
+                        iterationElapsedMinutes = $elapsedMinutes
+                    } -ProjectPath $ProjectPath
+                    Write-RalphLog "Iteration in progress: ${elapsedMinutes}m elapsed (timeout: ${TimeoutMinutes}m)" -Level "INFO"
+                    $lastStatusUpdate = Get-Date
+                }
+
+                Start-Sleep -Milliseconds 500
+            }
+
+            # Process completed - read output
+            $output = $process.StandardOutput.ReadToEnd()
+            $stderr = $process.StandardError.ReadToEnd()
+
+            # Cleanup temp files
+            Remove-Item $tempPromptFile -Force -ErrorAction SilentlyContinue
+            Remove-Item $tempStdoutFile -Force -ErrorAction SilentlyContinue
+            Remove-Item $tempStderrFile -Force -ErrorAction SilentlyContinue
+
+            $elapsedMinutes = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+
+            Update-RalphState -Updates @{
+                iterationStatus = "completed"
+                iterationElapsedMinutes = $elapsedMinutes
+            } -ProjectPath $ProjectPath
+
+            if ($process.ExitCode -ne 0) {
+                Write-RalphLog "Codex process exited with code $($process.ExitCode): $stderr" -Level "ERROR"
+
+                # Update conversation log with error
+                if ($convEntryId) {
+                    Update-ConversationEntry `
+                        -EntryId $convEntryId `
+                        -Response $output `
+                        -Status "error" `
+                        -ElapsedMinutes $elapsedMinutes `
+                        -Error "Codex exited with code $($process.ExitCode): $stderr" `
+                        -ProjectPath $ProjectPath
+                }
+
+                return @{
+                    Success = $false
+                    Output = $output
+                    Error = "Codex exited with code $($process.ExitCode): $stderr"
+                }
+            }
+
+            # Parse Codex JSONL output - extract the response content
+            # Codex returns JSONL (one JSON object per line)
+            $parsedOutput = $null
+            $outputLines = $output -split "`n" | Where-Object { $_.Trim() }
+            foreach ($line in $outputLines) {
+                try {
+                    $jsonObj = $line | ConvertFrom-Json
+                    # Codex format: {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+                    if ($jsonObj.type -eq "item.completed" -and $jsonObj.item.type -eq "agent_message" -and $jsonObj.item.text) {
+                        $parsedOutput = $jsonObj.item.text
+                    }
+                    # Fallback patterns for other formats
+                    elseif ($jsonObj.type -eq "message" -and $jsonObj.content) {
+                        $parsedOutput = $jsonObj.content
+                    } elseif ($jsonObj.message) {
+                        $parsedOutput = $jsonObj.message
+                    } elseif ($jsonObj.output) {
+                        $parsedOutput = $jsonObj.output
+                    } elseif ($jsonObj.result) {
+                        $parsedOutput = $jsonObj.result
+                    }
+                } catch {
+                    # Not valid JSON, skip
+                }
+            }
+
+            # If we couldn't parse structured output, use raw output
+            if (-not $parsedOutput) {
+                $parsedOutput = $output
+            }
+
+            Write-RalphLog "Codex completed in ${elapsedMinutes}m, response length: $($parsedOutput.Length) chars" -Level "DEBUG"
+
+            # Log first part of response for debugging
+            $preview = if ($parsedOutput.Length -gt 200) { $parsedOutput.Substring(0, 200) + "..." } else { $parsedOutput }
+            Write-RalphLog "Codex response preview: $preview" -Level "DEBUG"
+
+            # Update conversation log with successful response
+            if ($convEntryId) {
+                Update-ConversationEntry `
+                    -EntryId $convEntryId `
+                    -Response $parsedOutput `
+                    -Status "completed" `
+                    -ElapsedMinutes $elapsedMinutes `
+                    -ProjectPath $ProjectPath
+            }
+
+            return @{
+                Success = $true
+                Output = $parsedOutput
+                Error = $null
+                ElapsedMinutes = $elapsedMinutes
+            }
+        } catch {
+            $errorMsg = $_.Exception.Message
+            Write-RalphLog "Codex invocation failed: $errorMsg" -Level "ERROR"
+
+            Update-RalphState -Updates @{
+                iterationStatus = "error"
+            } -ProjectPath $ProjectPath
+
+            # Update conversation log with error (if entry was created)
+            if ($convEntryId) {
+                Update-ConversationEntry `
+                    -EntryId $convEntryId `
+                    -Status "error" `
+                    -Error $errorMsg `
+                    -ProjectPath $ProjectPath
+            }
+
+            if ($attempt -lt $retryCount) {
+                Write-RalphLog "Retrying in $cooldown seconds..." -Level "WARN"
+                Start-Sleep -Seconds $cooldown
+            } else {
+                return @{
+                    Success = $false
+                    Output = $null
+                    Error = $errorMsg
+                }
+            }
+        }
+    }
+}
+
+# ============================================================================
+# OPENCODE CLI WRAPPER
+# ============================================================================
+
+function Invoke-OpenCode {
+    <#
+    .SYNOPSIS
+        Invokes OpenCode CLI with rate limiting, retry logic, timeout, and conversation logging
+    .PARAMETER Prompt
+        The prompt to send to OpenCode
+    .PARAMETER TimeoutMinutes
+        Timeout in minutes (from config if not specified)
+    .PARAMETER Iteration
+        Current iteration number (for logging)
+    .PARAMETER TaskId
+        Current task ID (for logging)
+    .PARAMETER TaskTitle
+        Current task title (for logging)
+    .DESCRIPTION
+        OpenCode CLI:
+        - Command: opencode run "prompt"
+        - Model: -m provider/model (optional, uses default if not set)
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [int]$TimeoutMinutes,
+
+        [int]$Iteration = 0,
+
+        [string]$TaskId = "unknown",
+
+        [string]$TaskTitle = "Unknown Task",
+
+        [string]$ProjectPath = (Get-Location).Path
+    )
+
+    $config = Get-RalphConfig -ProjectPath $ProjectPath
+
+    if (-not $TimeoutMinutes -or $TimeoutMinutes -le 0) {
+        $TimeoutMinutes = if ($config.iterationTimeoutMinutes) { $config.iterationTimeoutMinutes } else { 15 }
+    }
+
+    $retryCount = $config.rateLimiting.retryCount
+    $cooldown = $config.rateLimiting.cooldownSeconds
+    $timeoutSeconds = $TimeoutMinutes * 60
+
+    for ($attempt = 0; $attempt -le $retryCount; $attempt++) {
+        # Check rate limit
+        $rateCheck = Test-RateLimitOk -ProjectPath $ProjectPath
+        if (-not $rateCheck.Ok) {
+            Write-RalphLog "Rate limit reached. Waiting $($rateCheck.WaitSeconds) seconds..." -Level "WARN"
+            Start-Sleep -Seconds $rateCheck.WaitSeconds
+        }
+
+        # Record call timestamp
+        Add-CallTimestamp -ProjectPath $ProjectPath
+
+        try {
+            Write-RalphLog "Invoking OpenCode (attempt $($attempt + 1), timeout: ${TimeoutMinutes}m)..." -Level "DEBUG"
+
+            # Update state with iteration start time
+            Update-RalphState -Updates @{
+                iterationStartTime = (Get-Date).ToString("o")
+                iterationStatus = "running"
+            } -ProjectPath $ProjectPath
+
+            # Create conversation log entry
+            $convEntryId = Add-ConversationEntry `
+                -Iteration $Iteration `
+                -TaskId $TaskId `
+                -TaskTitle $TaskTitle `
+                -Prompt $Prompt `
+                -Status "running" `
+                -ProjectPath $ProjectPath
+
+            # Write prompt to temp file to avoid command line length limits
+            $tempPromptFile = [System.IO.Path]::GetTempFileName()
+            Set-Content -Path $tempPromptFile -Value $Prompt -Encoding UTF8
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "opencode"
+            # OpenCode uses: opencode run "prompt"
+            $psi.Arguments = "run `"$(Get-Content $tempPromptFile -Raw)`""
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.CreateNoWindow = $true
+            $psi.WorkingDirectory = $ProjectPath
+
+            $process = [System.Diagnostics.Process]::Start($psi)
+
+            # Poll for completion with timeout, updating state periodically
+            $startTime = Get-Date
+            $lastStatusUpdate = $startTime
+            $statusUpdateInterval = 30  # Update state every 30 seconds
+
+            while (-not $process.HasExited) {
+                $elapsed = (Get-Date) - $startTime
+                $elapsedMinutes = [math]::Round($elapsed.TotalMinutes, 1)
+
+                # Check timeout
+                if ($elapsed.TotalSeconds -ge $timeoutSeconds) {
+                    Write-RalphLog "Iteration timeout (${TimeoutMinutes}m) exceeded. Killing OpenCode process..." -Level "WARN"
+
+                    try {
+                        $process.Kill()
+                        $process.WaitForExit(5000)
+                    } catch {
+                        Write-RalphLog "Failed to kill process: $_" -Level "ERROR"
+                    }
+
+                    # Cleanup temp files
+                    Remove-Item $tempPromptFile -Force -ErrorAction SilentlyContinue
+
+                    Update-RalphState -Updates @{
+                        iterationStatus = "timeout"
+                        iterationElapsedMinutes = $elapsedMinutes
+                    } -ProjectPath $ProjectPath
+
+                    # Update conversation log with timeout
+                    if ($convEntryId) {
+                        Update-ConversationEntry `
+                            -EntryId $convEntryId `
+                            -Status "timeout" `
+                            -ElapsedMinutes $elapsedMinutes `
+                            -Error "Iteration timed out after $TimeoutMinutes minutes" `
+                            -ProjectPath $ProjectPath
+                    }
+
+                    return @{
+                        Success = $false
+                        Output = $null
+                        Error = "Iteration timed out after $TimeoutMinutes minutes"
+                        TimedOut = $true
+                    }
+                }
+
+                # Periodic status update
+                if (((Get-Date) - $lastStatusUpdate).TotalSeconds -ge $statusUpdateInterval) {
+                    Update-RalphState -Updates @{
+                        iterationElapsedMinutes = $elapsedMinutes
+                    } -ProjectPath $ProjectPath
+                    Write-RalphLog "Iteration in progress: ${elapsedMinutes}m elapsed (timeout: ${TimeoutMinutes}m)" -Level "INFO"
+                    $lastStatusUpdate = Get-Date
+                }
+
+                Start-Sleep -Milliseconds 500
+            }
+
+            # Process completed - read output
+            $output = $process.StandardOutput.ReadToEnd()
+            $stderr = $process.StandardError.ReadToEnd()
+
+            # Cleanup temp file
+            Remove-Item $tempPromptFile -Force -ErrorAction SilentlyContinue
+
+            $elapsedMinutes = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+
+            Update-RalphState -Updates @{
+                iterationStatus = "completed"
+                iterationElapsedMinutes = $elapsedMinutes
+            } -ProjectPath $ProjectPath
+
+            if ($process.ExitCode -ne 0) {
+                Write-RalphLog "OpenCode process exited with code $($process.ExitCode): $stderr" -Level "ERROR"
+
+                # Update conversation log with error
+                if ($convEntryId) {
+                    Update-ConversationEntry `
+                        -EntryId $convEntryId `
+                        -Response $output `
+                        -Status "error" `
+                        -ElapsedMinutes $elapsedMinutes `
+                        -Error "OpenCode exited with code $($process.ExitCode): $stderr" `
+                        -ProjectPath $ProjectPath
+                }
+
+                return @{
+                    Success = $false
+                    Output = $output
+                    Error = "OpenCode exited with code $($process.ExitCode): $stderr"
+                }
+            }
+
+            Write-RalphLog "OpenCode completed in ${elapsedMinutes}m, response length: $($output.Length) chars" -Level "DEBUG"
+
+            # Log first part of response for debugging
+            $preview = if ($output.Length -gt 200) { $output.Substring(0, 200) + "..." } else { $output }
+            Write-RalphLog "OpenCode response preview: $preview" -Level "DEBUG"
+
+            # Update conversation log with successful response
+            if ($convEntryId) {
+                Update-ConversationEntry `
+                    -EntryId $convEntryId `
+                    -Response $output `
+                    -Status "completed" `
+                    -ElapsedMinutes $elapsedMinutes `
+                    -ProjectPath $ProjectPath
+            }
+
+            return @{
+                Success = $true
+                Output = $output
+                Error = $null
+                ElapsedMinutes = $elapsedMinutes
+            }
+        } catch {
+            $errorMsg = $_.Exception.Message
+            Write-RalphLog "OpenCode invocation failed: $errorMsg" -Level "ERROR"
+
+            Update-RalphState -Updates @{
+                iterationStatus = "error"
+            } -ProjectPath $ProjectPath
+
+            # Update conversation log with error (if entry was created)
+            if ($convEntryId) {
+                Update-ConversationEntry `
+                    -EntryId $convEntryId `
+                    -Status "error" `
+                    -Error $errorMsg `
+                    -ProjectPath $ProjectPath
+            }
+
+            if ($attempt -lt $retryCount) {
+                Write-RalphLog "Retrying in $cooldown seconds..." -Level "WARN"
+                Start-Sleep -Seconds $cooldown
+            } else {
+                return @{
+                    Success = $false
+                    Output = $null
+                    Error = $errorMsg
+                }
+            }
+        }
+    }
+}
+
+# ============================================================================
+# ENGINE WRAPPER (dispatches to Claude, Codex, or OpenCode)
+# ============================================================================
+
+function Invoke-Engine {
+    <#
+    .SYNOPSIS
+        Invokes the configured engine (Claude, Codex, or OpenCode)
+    .DESCRIPTION
+        Wrapper function that dispatches to Invoke-Claude, Invoke-Codex, or Invoke-OpenCode
+        based on the engine setting in config or the override parameter
+    .PARAMETER Prompt
+        The prompt to send
+    .PARAMETER Engine
+        Override engine selection ("claude", "codex", or "opencode")
+    .PARAMETER Model
+        Model to use (Claude only)
+    .PARAMETER MaxTurns
+        Maximum turns (Claude only)
+    .PARAMETER TimeoutMinutes
+        Timeout in minutes
+    .PARAMETER Iteration
+        Current iteration number (for logging)
+    .PARAMETER TaskId
+        Current task ID (for logging)
+    .PARAMETER TaskTitle
+        Current task title (for logging)
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [ValidateSet("claude", "codex", "opencode")]
+        [string]$Engine,
+
+        [string]$Model,
+
+        [int]$MaxTurns,
+
+        [int]$TimeoutMinutes,
+
+        [int]$Iteration = 0,
+
+        [string]$TaskId = "unknown",
+
+        [string]$TaskTitle = "Unknown Task",
+
+        [string]$ProjectPath = (Get-Location).Path
+    )
+
+    $config = Get-RalphConfig -ProjectPath $ProjectPath
+
+    # Determine which engine to use
+    $selectedEngine = if ($Engine) { $Engine } else { $config.engine }
+    if (-not $selectedEngine) {
+        $selectedEngine = "claude"  # Default to Claude
+    }
+
+    Write-RalphLog "Using engine: $selectedEngine" -Level "DEBUG"
+
+    if ($selectedEngine -eq "codex") {
+        return Invoke-Codex `
+            -Prompt $Prompt `
+            -TimeoutMinutes $TimeoutMinutes `
+            -Iteration $Iteration `
+            -TaskId $TaskId `
+            -TaskTitle $TaskTitle `
+            -ProjectPath $ProjectPath
+    } elseif ($selectedEngine -eq "opencode") {
+        return Invoke-OpenCode `
+            -Prompt $Prompt `
+            -TimeoutMinutes $TimeoutMinutes `
+            -Iteration $Iteration `
+            -TaskId $TaskId `
+            -TaskTitle $TaskTitle `
+            -ProjectPath $ProjectPath
+    } else {
+        return Invoke-Claude `
+            -Prompt $Prompt `
+            -Model $Model `
+            -MaxTurns $MaxTurns `
+            -TimeoutMinutes $TimeoutMinutes `
+            -Iteration $Iteration `
+            -TaskId $TaskId `
+            -TaskTitle $TaskTitle `
+            -ProjectPath $ProjectPath
+    }
+}
+
+function Invoke-EngineSimple {
+    <#
+    .SYNOPSIS
+        Simple one-shot engine invocation for PRD transformation
+    .DESCRIPTION
+        Simpler wrapper for non-iteration uses like PRD transformation.
+        Does not track conversation logs or iteration state.
+    .PARAMETER Prompt
+        The prompt to send
+    .PARAMETER Engine
+        Override engine selection ("claude", "codex", or "opencode")
+    .PARAMETER ProjectPath
+        Project path for config lookup
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [ValidateSet("claude", "codex", "opencode")]
+        [string]$Engine,
+
+        [string]$ProjectPath = (Get-Location).Path
+    )
+
+    $config = Get-RalphConfig -ProjectPath $ProjectPath
+
+    # Determine which engine to use
+    $selectedEngine = if ($Engine) { $Engine } else { $config.engine }
+    if (-not $selectedEngine) {
+        $selectedEngine = "claude"  # Default to Claude
+    }
+
+    Write-RalphLog "Using engine for simple invocation: $selectedEngine" -Level "DEBUG"
+
+    if ($selectedEngine -eq "codex") {
+        # Codex: Pass prompt via stdin to avoid all escaping issues
+        # codex exec - --dangerously-bypass-approvals-and-sandbox --json
+        $currentLocation = Get-Location
+        $tempStderrFile = [System.IO.Path]::GetTempFileName()
+        try {
+            Set-Location $ProjectPath
+            # Get model from config if available
+            $codexModel = $config.codexModel
+
+            # Use & operator with stdin piping, redirect stderr to file to avoid log pollution
+            if ($codexModel) {
+                $jsonContent = $Prompt | & codex exec - -m $codexModel --dangerously-bypass-approvals-and-sandbox --json 2>$tempStderrFile
+            } else {
+                $jsonContent = $Prompt | & codex exec - --dangerously-bypass-approvals-and-sandbox --json 2>$tempStderrFile
+            }
+            $jsonContent = $jsonContent | Out-String
+
+            # If stdout is empty, check stderr for debugging
+            if (-not $jsonContent) {
+                $stderrContent = Get-Content $tempStderrFile -Raw -ErrorAction SilentlyContinue
+                if ($stderrContent) {
+                    Write-RalphLog "Codex stderr: $($stderrContent.Substring(0, [Math]::Min(500, $stderrContent.Length)))" -Level "DEBUG"
+                }
+            }
+        } finally {
+            Set-Location $currentLocation
+            Remove-Item $tempStderrFile -Force -ErrorAction SilentlyContinue
+        }
+
+        # Parse JSONL output - codex outputs multiple JSON lines
+        $outputLines = $jsonContent -split "`n" | Where-Object { $_.Trim() }
+        foreach ($line in $outputLines) {
+            try {
+                $jsonObj = $line | ConvertFrom-Json
+                # Codex format: {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+                if ($jsonObj.type -eq "item.completed" -and $jsonObj.item.type -eq "agent_message" -and $jsonObj.item.text) {
+                    return $jsonObj.item.text
+                }
+                # Fallback patterns for other formats
+                elseif ($jsonObj.type -eq "message" -and $jsonObj.content) {
+                    return $jsonObj.content
+                } elseif ($jsonObj.message) {
+                    return $jsonObj.message
+                } elseif ($jsonObj.output) {
+                    return $jsonObj.output
+                } elseif ($jsonObj.result) {
+                    return $jsonObj.result
+                }
+            } catch {
+                # Not valid JSON, skip
+            }
+        }
+        # Fallback to raw output
+        return $jsonContent
+    } elseif ($selectedEngine -eq "opencode") {
+        # OpenCode: opencode run "prompt" - use temp file approach
+        $tempPromptFile = [System.IO.Path]::GetTempFileName()
+        try {
+            Set-Content -Path $tempPromptFile -Value $Prompt -Encoding UTF8
+            $promptContent = Get-Content $tempPromptFile -Raw
+            $result = & opencode run $promptContent 2>&1
+        } finally {
+            Remove-Item $tempPromptFile -Force -ErrorAction SilentlyContinue
+        }
+        return $result | Out-String
+    } else {
+        # Claude: claude -p "prompt" --output-format json - use temp file approach
+        $tempPromptFile = [System.IO.Path]::GetTempFileName()
+        try {
+            Set-Content -Path $tempPromptFile -Value $Prompt -Encoding UTF8
+            $promptContent = Get-Content $tempPromptFile -Raw
+            $result = & claude -p $promptContent --output-format json 2>&1
+        } finally {
+            Remove-Item $tempPromptFile -Force -ErrorAction SilentlyContinue
+        }
+        return $result | Out-String
+    }
+}
+
+# ============================================================================
 # EXPORTS (only when loaded as module)
 # ============================================================================
 
@@ -1534,6 +2884,12 @@ if ($MyInvocation.MyCommand.ScriptBlock.Module) {
         'Save-RalphPrd',
         'ConvertFrom-MarkdownPrd',
         'Update-TaskStatus',
+
+        # Dependency management
+        'Test-DependencyValidation',
+        'Test-CircularDependencies',
+        'Build-DependencyGraph',
+        'Get-NextAvailableTask',
 
         # Signal parsing
         'Find-CompletionSignal',
@@ -1570,6 +2926,16 @@ if ($MyInvocation.MyCommand.ScriptBlock.Module) {
         'Update-ConversationEntry',
 
         # Claude CLI
-        'Invoke-Claude'
+        'Invoke-Claude',
+
+        # Codex CLI
+        'Invoke-Codex',
+
+        # OpenCode CLI
+        'Invoke-OpenCode',
+
+        # Engine wrapper
+        'Invoke-Engine',
+        'Invoke-EngineSimple'
     )
 }

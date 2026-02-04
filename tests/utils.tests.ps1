@@ -326,7 +326,8 @@ Describe "Port Management" {
 
         It "Should return true for port in use" {
             $testPort = 5556
-            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $testPort)
+            # Bind to Any (0.0.0.0) to match what Test-PortInUse checks
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $testPort)
             $listener.Start()
 
             try {

@@ -17,6 +17,12 @@
     Force reinitialize, overwriting existing .ralph directory
 .PARAMETER MaxIterations
     Override max iterations from config
+.PARAMETER Engine
+    Override the AI engine to use ("claude", "codex", or "opencode"). Default is from config.
+.PARAMETER Codex
+    Shorthand for -Engine codex. Use OpenAI Codex CLI instead of Claude.
+.PARAMETER OpenCode
+    Shorthand for -Engine opencode. Use OpenCode CLI instead of Claude.
 .PARAMETER DryRun
     Preview what would happen without executing
 .EXAMPLE
@@ -25,6 +31,15 @@
 .EXAMPLE
     .\ralph.ps1 -FromMd -PrdPath ".\PROMPT.md"
     Transform markdown PRD and start loop
+.EXAMPLE
+    .\ralph.ps1 -FromMd -PrdPath ".\PROMPT.md" -Codex
+    Transform markdown PRD and start loop using Codex engine
+.EXAMPLE
+    .\ralph.ps1 -FromMd -PrdPath ".\PROMPT.md" -OpenCode
+    Transform markdown PRD and start loop using OpenCode
+.EXAMPLE
+    .\ralph.ps1 -Resume -Codex
+    Resume a paused session using Codex
 .EXAMPLE
     .\ralph.ps1 -Resume
     Resume a paused session
@@ -38,12 +53,23 @@ param(
     [switch]$Resume,
     [switch]$Reinit,
     [int]$MaxIterations,
+    [ValidateSet("claude", "codex", "opencode")]
+    [string]$Engine,
+    [switch]$Codex,
+    [switch]$OpenCode,
     [switch]$DryRun
 )
 
 # Get script directory and load utils
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $ScriptDir "utils.ps1")
+
+# Handle engine shorthand flags
+if ($Codex) {
+    $Engine = "codex"
+} elseif ($OpenCode) {
+    $Engine = "opencode"
+}
 
 # ============================================================================
 # GLOBAL STATE
@@ -69,11 +95,20 @@ function Stop-RalphProcesses {
         }
     }
 
-    # Update state to paused
+    # Update state to paused and accumulate active runtime
     $state = Get-RalphState
     if ($state) {
+        $sessionMinutes = 0
+        if ($state.startTime) {
+            $startTime = [datetime]$state.startTime
+            $sessionMinutes = ((Get-Date) - $startTime).TotalMinutes
+        }
+        $previousMinutes = if ($state.totalActiveMinutes) { $state.totalActiveMinutes } else { 0 }
+
         Update-RalphState -Updates @{
             status = "paused"
+            iterationStatus = "interrupted"
+            totalActiveMinutes = $previousMinutes + $sessionMinutes
         }
     }
 }
@@ -235,14 +270,21 @@ function Start-MonitorDashboard {
     try {
         $serverPath = Join-Path $dashboardDir "server\index.js"
 
+        # Check if monitor already running before starting
+        if (Test-ApiHealth -Port $monitorPort) {
+            Write-RalphLog "Monitor dashboard already running on port $monitorPort" -Level "INFO"
+            return $true
+        }
+
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = "node"
         $psi.Arguments = "`"$serverPath`""
         $psi.WorkingDirectory = $dashboardDir
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
+        # Don't redirect streams - buffer overflow can kill the process on Windows
+        $psi.RedirectStandardOutput = $false
+        $psi.RedirectStandardError = $false
 
         $script:MonitorProcess = [System.Diagnostics.Process]::Start($psi)
         Write-RalphLog "Started monitor process (PID: $($script:MonitorProcess.Id))" -Level "DEBUG"
@@ -252,18 +294,13 @@ function Start-MonitorDashboard {
 
         # Check if process is still running
         if ($script:MonitorProcess.HasExited) {
-            $stderr = $script:MonitorProcess.StandardError.ReadToEnd()
-
             # Check if it failed because monitor is already running (EADDRINUSE)
-            if ($stderr -match "EADDRINUSE") {
-                # Another monitor is running - check if it's healthy
-                if (Test-ApiHealth -Port $monitorPort) {
-                    Write-RalphLog "Monitor dashboard already running on port $monitorPort (detected via EADDRINUSE)" -Level "INFO"
-                    return $true
-                }
+            if (Test-ApiHealth -Port $monitorPort) {
+                Write-RalphLog "Monitor dashboard already running on port $monitorPort (detected via EADDRINUSE)" -Level "INFO"
+                return $true
             }
 
-            Write-RalphLog "Monitor process exited early. Exit code: $($script:MonitorProcess.ExitCode). Error: $stderr" -Level "ERROR"
+            Write-RalphLog "Monitor process exited early. Exit code: $($script:MonitorProcess.ExitCode)" -Level "ERROR"
             return $false
         }
 
@@ -308,23 +345,37 @@ function Start-ProjectApi {
         $psi.WorkingDirectory = $dashboardDir
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
+        # Don't redirect streams - buffer overflow can kill the process on Windows
+        $psi.RedirectStandardOutput = $false
+        $psi.RedirectStandardError = $false
 
         $script:ApiProcess = [System.Diagnostics.Process]::Start($psi)
         Write-RalphLog "Started project API process (PID: $($script:ApiProcess.Id)) on port $port" -Level "DEBUG"
 
-        # Wait for server to start
-        Start-Sleep -Seconds 3
+        # Wait for server to start with retry loop
+        $maxRetries = 5
+        $retryDelay = 2
+        $healthy = $false
 
-        # Check if process is still running
-        if ($script:ApiProcess.HasExited) {
-            $stderr = $script:ApiProcess.StandardError.ReadToEnd()
-            Write-RalphLog "Project API exited early. Exit code: $($script:ApiProcess.ExitCode). Error: $stderr" -Level "ERROR"
-            return $null
+        for ($i = 1; $i -le $maxRetries; $i++) {
+            Start-Sleep -Seconds $retryDelay
+
+            # Check if process died
+            if ($script:ApiProcess.HasExited) {
+                Write-RalphLog "Project API exited early. Exit code: $($script:ApiProcess.ExitCode)" -Level "ERROR"
+                return $null
+            }
+
+            # Try health check
+            if (Test-ApiHealth -Port $port) {
+                $healthy = $true
+                break
+            }
+
+            Write-RalphLog "Health check attempt $i/$maxRetries failed, retrying..." -Level "DEBUG"
         }
 
-        if (Test-ApiHealth -Port $port) {
+        if ($healthy) {
             Write-RalphLog "Project API started on port $port" -Level "INFO"
 
             # Update state with port
@@ -335,7 +386,11 @@ function Start-ProjectApi {
 
             return $port
         } else {
-            Write-RalphLog "Project API failed health check on port $port" -Level "WARN"
+            Write-RalphLog "Project API failed health check on port $port after $maxRetries attempts" -Level "WARN"
+            # Kill the process since it's not responding
+            if (-not $script:ApiProcess.HasExited) {
+                $script:ApiProcess.Kill()
+            }
             return $null
         }
     } catch {
@@ -378,11 +433,15 @@ function Start-RalphLoop {
     #>
     [CmdletBinding()]
     param(
-        [int]$OverrideMaxIterations
+        [int]$OverrideMaxIterations,
+
+        [ValidateSet("claude", "codex")]
+        [string]$OverrideEngine
     )
 
     $config = Get-RalphConfig
     $maxIter = if ($OverrideMaxIterations -gt 0) { $OverrideMaxIterations } else { $config.maxIterations }
+    $engineToUse = if ($OverrideEngine) { $OverrideEngine } else { $config.engine }
 
     # Clear any existing stop signal
     Clear-StopSignal
@@ -395,7 +454,7 @@ function Start-RalphLoop {
     $state = Get-RalphState
     $startIteration = if ($state.currentIteration) { $state.currentIteration } else { 0 }
 
-    Write-RalphLog "Starting Ralph loop from iteration $startIteration (max: $maxIter)" -Level "INFO"
+    Write-RalphLog "Starting Ralph loop from iteration $startIteration (max: $maxIter, engine: $engineToUse)" -Level "INFO"
 
     for ($iteration = $startIteration; $iteration -lt $maxIter; $iteration++) {
         Write-Host ""
@@ -408,6 +467,7 @@ function Start-RalphLoop {
             Write-RalphLog "Stop signal detected. Pausing..." -Level "INFO"
             Update-RalphState -Updates @{
                 status = "paused"
+                iterationStatus = "interrupted"
                 currentIteration = $iteration
             }
             return "stopped"
@@ -443,8 +503,36 @@ function Start-RalphLoop {
             return "completed"
         }
 
-        $currentTask = $pendingTasks[0]
+        # Use dependency-aware task selection
+        $currentTask = Get-NextAvailableTask -Prd $prd
+
+        if (-not $currentTask) {
+            # All remaining tasks are blocked by unmet dependencies
+            Write-RalphLog "All remaining tasks blocked by unmet dependencies" -Level "WARN"
+            Update-RalphState -Updates @{
+                status = "dependency_blocked"
+                currentIteration = $iteration
+            }
+            return "dependency_blocked"
+        }
         Write-RalphLog "Working on task $($currentTask.id): $($currentTask.title)" -Level "INFO"
+
+        # Check if this task has exceeded timeout retries
+        $taskTimeoutCheck = Test-TaskTimeoutCircuitBreaker -TaskId $currentTask.id
+        if ($taskTimeoutCheck.Triggered) {
+            Write-RalphLog "Task timeout circuit breaker: $($taskTimeoutCheck.Reason)" -Level "WARN"
+            Update-TaskStatus -TaskId $currentTask.id -Status "blocked"
+            Update-RalphState -Updates @{
+                status = "circuit_breaker"
+            }
+            return "circuit_breaker"
+        }
+
+        # Calculate effective timeout (may be extended if task previously timed out)
+        $timeoutInfo = Get-EffectiveTimeout -TaskId $currentTask.id
+        if ($timeoutInfo.ExtensionCount -gt 0) {
+            Write-RalphLog "Task has timed out $($timeoutInfo.PreviousTimeouts) time(s), extending timeout to $($timeoutInfo.TimeoutMinutes)m (+$($timeoutInfo.ExtensionCount * $config.circuitBreaker.timeoutExtensionMinutes)m)" -Level "INFO"
+        }
 
         # Mark task as in progress
         Update-TaskStatus -TaskId $currentTask.id -Status "in_progress"
@@ -455,17 +543,45 @@ function Start-RalphLoop {
         # Build prompt for Claude
         $prompt = Build-IterationPrompt -Task $currentTask -Prd $prd -Iteration $iteration
 
-        # Invoke Claude
-        $result = Invoke-Claude `
+        # Log conversation entry before invoking
+        $conversationId = Add-ConversationEntry `
+            -Iteration $iteration `
+            -TaskId $currentTask.id `
+            -TaskTitle $currentTask.title `
             -Prompt $prompt `
+            -Status "running"
+
+        # Invoke the configured engine (Claude or Codex) with effective timeout
+        $result = Invoke-Engine `
+            -Prompt $prompt `
+            -Engine $engineToUse `
             -Model $config.model `
             -MaxTurns $config.maxTurnsPerIteration `
+            -TimeoutMinutes $timeoutInfo.TimeoutMinutes `
             -Iteration $iteration `
             -TaskId $currentTask.id `
             -TaskTitle $currentTask.title
 
         if (-not $result.Success) {
-            Write-RalphLog "Claude invocation failed: $($result.Error)" -Level "ERROR"
+            Write-RalphLog "Engine invocation failed: $($result.Error)" -Level "ERROR"
+
+            # Update conversation with error
+            if ($conversationId) {
+                Update-ConversationEntry -EntryId $conversationId -Status "error" -Error $result.Error
+            }
+
+            # Track timeout for task-specific circuit breaker
+            if ($result.TimedOut) {
+                $newTimeoutCount = Add-TaskTimeout -TaskId $currentTask.id
+                $maxTimeouts = if ($config.circuitBreaker.maxTaskTimeouts) { $config.circuitBreaker.maxTaskTimeouts } else { 3 }
+                $remainingRetries = $maxTimeouts - $newTimeoutCount
+                if ($remainingRetries -gt 0) {
+                    $nextExtension = $config.circuitBreaker.timeoutExtensionMinutes
+                    Write-RalphLog "Task timed out ($newTimeoutCount/$maxTimeouts). Will retry with +${nextExtension}m timeout ($remainingRetries retries remaining)" -Level "WARN"
+                } else {
+                    Write-RalphLog "Task reached maximum timeouts ($newTimeoutCount/$maxTimeouts). Will trigger circuit breaker on next attempt." -Level "WARN"
+                }
+            }
 
             # Track error for circuit breaker
             $state = Get-RalphState
@@ -494,18 +610,30 @@ function Start-RalphLoop {
             Update-TaskStatus -TaskId $currentTask.id -Status "blocked"
         }
 
+        # Update conversation with response
+        if ($conversationId) {
+            $convStatus = if ($signal -eq "COMPLETE") { "completed" } elseif ($signal -eq "BLOCKED") { "blocked" } else { "completed" }
+            Update-ConversationEntry `
+                -EntryId $conversationId `
+                -Response $result.Output `
+                -Status $convStatus `
+                -ElapsedMinutes $result.ElapsedMinutes
+        }
+
         # Check for changes
         $changesAfter = Get-GitChanges
         $hasChanges = $changesAfter.Count -ne $changesBefore.Count
 
-        if ($hasChanges) {
+        # Reset noChangeCount if task completed OR if there are git changes
+        # This prevents circuit breaker from triggering when tasks complete without code changes
+        if ($hasChanges -or $signal -eq "COMPLETE") {
             Update-RalphState -Updates @{
                 noChangeCount = 0
                 filesChanged = @($changesAfter | ForEach-Object { $_.Path })
             }
 
-            # Auto-commit if enabled
-            if ($config.git.autoCommit) {
+            # Auto-commit if enabled and there are changes
+            if ($hasChanges -and $config.git.autoCommit) {
                 $commitMsg = "$($config.git.commitMessagePrefix) $($iteration + 1): $($currentTask.title)"
                 New-GitCommit -Message $commitMsg
             }
@@ -561,6 +689,46 @@ function Build-IterationPrompt {
         "No specific criteria defined"
     }
 
+    # Build dependency context
+    $dependencyContext = ""
+    if ($Task.dependencies -and $Task.dependencies.Count -gt 0) {
+        # Get completed dependencies for this task
+        $completedDeps = @()
+        foreach ($depId in $Task.dependencies) {
+            $depTask = $Prd.tasks | Where-Object { $_.id -eq $depId }
+            if ($depTask -and $depTask.status -eq "completed") {
+                $completedDeps += "- [$($depTask.id)] $($depTask.title)"
+            }
+        }
+        if ($completedDeps.Count -gt 0) {
+            $dependencyContext = @"
+
+## Completed Dependencies
+The following prerequisite tasks have been completed:
+$($completedDeps -join "`n")
+"@
+        }
+    }
+
+    # Find tasks that depend on current task (blocked by this one)
+    $blockedByThis = ""
+    $dependentTasks = @()
+    foreach ($t in $Prd.tasks) {
+        if ($t.dependencies -and $t.dependencies -contains $Task.id) {
+            if ($t.status -eq "pending") {
+                $dependentTasks += "- [$($t.id)] $($t.title)"
+            }
+        }
+    }
+    if ($dependentTasks.Count -gt 0) {
+        $blockedByThis = @"
+
+## Tasks Waiting on This
+The following tasks are waiting for this task to complete:
+$($dependentTasks -join "`n")
+"@
+    }
+
     $lines = @(
         "# Ralph Howell Loop - Iteration $($Iteration + 1)"
         ""
@@ -575,6 +743,8 @@ function Build-IterationPrompt {
         ""
         "**Acceptance Criteria:**"
         "$acceptanceCriteria"
+        "$dependencyContext"
+        "$blockedByThis"
         ""
         "## Completed Tasks"
         "$completedList"
@@ -670,7 +840,7 @@ function Main {
                 return
             }
 
-            $prd = ConvertFrom-MarkdownPrd -MarkdownPath $prdPath
+            $prd = ConvertFrom-MarkdownPrd -MarkdownPath $prdPath -Engine $Engine
             if (-not $prd) {
                 Write-RalphLog "Failed to transform PRD" -Level "ERROR"
                 return
@@ -704,6 +874,12 @@ function Main {
 
         $state = Get-RalphState
         Write-RalphLog "Resuming from iteration $($state.currentIteration)" -Level "INFO"
+
+        # Reset startTime for this session (totalActiveMinutes preserves previous runtime)
+        Update-RalphState -Updates @{
+            startTime = (Get-Date).ToString("o")
+        }
+
         Clear-StopSignal
     }
 
@@ -716,6 +892,8 @@ function Main {
         Write-Host "  PRD Type: $prdType" -ForegroundColor Yellow
 
         $config = Get-RalphConfig
+        $engineToShow = if ($Engine) { $Engine } else { $config.engine }
+        Write-Host "  Engine: $engineToShow" -ForegroundColor Yellow
         Write-Host "  Model: $($config.model)" -ForegroundColor Yellow
         Write-Host "  Max Iterations: $($config.maxIterations)" -ForegroundColor Yellow
 
@@ -737,7 +915,10 @@ function Main {
 
     # Run the main loop
     try {
-        $result = Start-RalphLoop -OverrideMaxIterations $MaxIterations
+        $loopParams = @{}
+        if ($MaxIterations -gt 0) { $loopParams['OverrideMaxIterations'] = $MaxIterations }
+        if ($Engine) { $loopParams['OverrideEngine'] = $Engine }
+        $result = Start-RalphLoop @loopParams
 
         Write-Host ""
         Write-Host "=======================================" -ForegroundColor Cyan

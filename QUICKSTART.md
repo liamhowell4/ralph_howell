@@ -21,10 +21,11 @@ The following has been configured:
 **Command Prompt or PowerShell:**
 ```cmd
 ralph                              # Interactive mode
-ralph -FromMd                      # Use PROMPT.md in current folder
-ralph -FromMd -PrdPath ".\my.md"   # Use specific markdown file
-ralph -Resume                      # Resume paused session
-ralph -DryRun                      # Preview without running
+ralph --from-md                    # Use PROMPT.md in current folder
+ralph --from-md --prd-path ".\my.md"   # Use specific markdown file
+ralph --resume                     # Resume paused session
+ralph --dry-run                    # Preview without running
+ralph --help                       # Show all options
 ```
 
 **Start the Dashboard:**
@@ -60,11 +61,12 @@ Ralph will transform this into tasks and work through them autonomously.
 | Command | Description |
 |---------|-------------|
 | `ralph` | Interactive setup |
-| `ralph -FromMd` | Transform PROMPT.md and start |
-| `ralph -FromJson -PrdPath ".\prd.json"` | Use existing PRD |
-| `ralph -Resume` | Continue paused session |
-| `ralph -Reinit` | Start fresh (overwrites .ralph/) |
-| `ralph -DryRun` | Preview only |
+| `ralph --from-md` | Transform PROMPT.md and start |
+| `ralph --from-json --prd-path ".\prd.json"` | Use existing PRD |
+| `ralph --resume` | Continue paused session |
+| `ralph --reinit` | Start fresh (overwrites .ralph/) |
+| `ralph --dry-run` | Preview only |
+| `ralph --help` | Show all options |
 | `ralph-dashboard` | Launch monitoring dashboard |
 
 ---

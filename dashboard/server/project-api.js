@@ -34,6 +34,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Disable caching for all API responses
+app.use((req, res, next) => {
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0'
+  });
+  next();
+});
+
 // Helper functions
 function readJsonFile(filename) {
   const filepath = join(RALPH_DIR, filename);
@@ -41,9 +51,15 @@ function readJsonFile(filename) {
     return null;
   }
   try {
-    const content = readFileSync(filepath, 'utf8');
+    // Use flag: 'r' to ensure fresh read on Windows (no caching)
+    const content = readFileSync(filepath, { encoding: 'utf8', flag: 'r' });
     return JSON.parse(content);
   } catch (e) {
+    // Handle file being written to (EBUSY on Windows)
+    if (e.code === 'EBUSY' || e.code === 'ENOENT') {
+      console.log(`File ${filename} busy or not found, will retry on next poll`);
+      return null;
+    }
     console.error(`Error reading ${filename}:`, e.message);
     return null;
   }
@@ -125,6 +141,48 @@ app.get('/api/prd', (req, res) => {
   const blocked = tasks.filter(t => t.status === 'blocked').length;
   const pending = tasks.filter(t => t.status === 'pending').length;
 
+  // Build map of task statuses for dependency checking
+  const taskStatus = {};
+  tasks.forEach(t => {
+    taskStatus[t.id] = t.status;
+    // Include subtasks if present
+    if (t.subtasks) {
+      t.subtasks.forEach(st => {
+        taskStatus[st.id] = st.status;
+      });
+    }
+  });
+
+  // Calculate dependency-aware stats
+  let dependencyBlocked = 0;
+  let available = 0;
+
+  const checkTaskAvailability = (task) => {
+    if (task.status !== 'pending' && task.status !== 'in_progress') {
+      return; // Skip completed/blocked tasks
+    }
+
+    const deps = task.dependencies || [];
+    const allDepsCompleted = deps.every(depId => taskStatus[depId] === 'completed');
+
+    if (allDepsCompleted) {
+      available++;
+    } else if (deps.length > 0) {
+      dependencyBlocked++;
+    } else {
+      // No dependencies, so it's available
+      available++;
+    }
+  };
+
+  tasks.forEach(task => {
+    checkTaskAvailability(task);
+    // Check subtasks too
+    if (task.subtasks) {
+      task.subtasks.forEach(st => checkTaskAvailability(st));
+    }
+  });
+
   res.json({
     ...prd,
     progress: {
@@ -133,6 +191,8 @@ app.get('/api/prd', (req, res) => {
       inProgress,
       blocked,
       pending,
+      dependencyBlocked,
+      available,
       percentComplete: tasks.length > 0 ? Math.round((completed / tasks.length) * 100) : 0
     }
   });
@@ -318,6 +378,21 @@ app.get('/api/rate-limit', (req, res) => {
     percentUsed: Math.round((recentCalls.length / maxCalls) * 100),
     timestamps: recentCalls
   });
+});
+
+// Global error handler for Express
+app.use((err, req, res, next) => {
+  console.error('Express error:', err.message);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Prevent crashes from unhandled errors
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (keeping server alive):', err.message);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled rejection (keeping server alive):', reason);
 });
 
 // Start server

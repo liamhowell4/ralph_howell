@@ -61,7 +61,31 @@ ralph-loop-system/
 | `-Resume` | Resume a paused session |
 | `-Reinit` | Force reinitialize |
 | `-MaxIterations <n>` | Override max iterations |
+| `-Engine <name>` | Select AI engine: `claude`, `codex`, or `opencode` |
+| `-Codex` | Shorthand for `-Engine codex` |
+| `-OpenCode` | Shorthand for `-Engine opencode` |
 | `-DryRun` | Preview without executing |
+
+## Engine Selection
+
+Ralph supports multiple AI engines. Use flags or set `"engine"` in config:
+
+```powershell
+# Claude (default)
+ralph --from-md --prd-path .\PROMPT.md
+
+# OpenAI Codex
+ralph --from-md --prd-path .\PROMPT.md --codex
+
+# OpenCode
+ralph --from-md --prd-path .\PROMPT.md --opencode
+```
+
+| Engine | CLI | Notes |
+|--------|-----|-------|
+| Claude | `claude` | Default. Uses `--model`, `--max-turns` |
+| Codex | `codex` | Uses `codex exec`. Model set via Codex config |
+| OpenCode | `opencode` | Uses `opencode run`. Model set via OpenCode config |
 
 ## Configuration
 
@@ -69,6 +93,7 @@ Configuration is stored in `.ralph/config.json`:
 
 ```json
 {
+  "engine": "claude",
   "model": "claude-opus-4-5-20250514",
   "maxIterations": 50,
   "maxTurnsPerIteration": 50,
@@ -171,7 +196,10 @@ The loop automatically stops when:
 
 - PowerShell 5.1 or later
 - Node.js 18 or later
-- Claude Code CLI (`claude`)
+- At least one AI CLI:
+  - Claude Code CLI (`claude`) - default
+  - OpenAI Codex CLI (`codex`) - optional
+  - OpenCode CLI (`opencode`) - optional
 
 ## Troubleshooting
 

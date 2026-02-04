@@ -45,7 +45,8 @@ function StatusPanel({ state, config }) {
     running: 'text-green-400',
     completed: 'text-blue-400',
     timeout: 'text-red-400',
-    error: 'text-red-400'
+    error: 'text-red-400',
+    interrupted: 'text-yellow-400'
   };
 
   const formatTime = (isoString) => {

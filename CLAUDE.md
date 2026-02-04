@@ -10,18 +10,26 @@ Ralph Howell Loop is an autonomous development loop system for Claude Code. It e
 
 ### Running the Loop
 
-```powershell
+```bash
 # Interactive mode
-.\scripts\ralph.ps1
+ralph
 
 # Transform markdown PRD and start
-.\scripts\ralph.ps1 -FromMd -PrdPath ".\PROMPT.md"
+ralph --from-md --prd-path ".\PROMPT.md"
 
 # Resume paused session
-.\scripts\ralph.ps1 -Resume
+ralph --resume
 
 # Dry run (preview without executing)
-.\scripts\ralph.ps1 -DryRun
+ralph --dry-run
+
+# Show help
+ralph --help
+```
+
+Or invoke the PowerShell script directly:
+```powershell
+.\scripts\ralph.ps1 -FromMd -PrdPath ".\PROMPT.md"
 ```
 
 ### Dashboard
