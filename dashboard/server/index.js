@@ -60,6 +60,8 @@ app.get('/api/projects', async (req, res) => {
     // Check health of each project
     let isAlive = false;
     let projectState = null;
+    let engine = null;
+    let model = null;
 
     try {
       const healthRes = await fetch(`http://localhost:${port}/api/health`, {
@@ -69,6 +71,8 @@ app.get('/api/projects', async (req, res) => {
         isAlive = true;
         const health = await healthRes.json();
         projectState = health.state;
+        engine = health.engine || null;
+        model = health.model || null;
       }
     } catch (e) {
       // Project is dead
@@ -79,7 +83,9 @@ app.get('/api/projects', async (req, res) => {
       ...project,
       port,
       isAlive,
-      state: projectState
+      state: projectState,
+      engine,
+      model
     });
   }
 

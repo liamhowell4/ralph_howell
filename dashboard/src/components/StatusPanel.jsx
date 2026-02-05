@@ -102,6 +102,19 @@ function StatusPanel({ state, config }) {
           <span className="text-white font-mono">{currentIteration || 0}</span>
         </div>
 
+        {(config?.model || config?.engine) && (
+          <div className="flex items-center justify-between">
+            <span className="text-gray-500">Model</span>
+            <span className="text-white text-sm truncate ml-2" title={`${config.engine || ''} / ${config.model || ''}`}>
+              {config.engine && config.engine !== 'claude'
+                ? config.engine
+                : config.model
+                  ? config.model.replace(/^claude-/, '').replace(/-\d{8}$/, '')
+                  : config.engine}
+            </span>
+          </div>
+        )}
+
         {/* Iteration timing - only show when there's an active/recent iteration */}
         {iterationStartTime && (
           <div className="pt-2 border-t border-gray-700">

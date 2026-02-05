@@ -2,10 +2,18 @@ import React from 'react';
 import { Link } from 'react-router-dom';
 
 function ProjectCard({ project }) {
-  const { name, port, path, isAlive, state } = project;
+  const { name, port, path, isAlive, state, engine, model } = project;
 
   const status = state?.status || (isAlive ? 'unknown' : 'offline');
   const iteration = state?.currentIteration || 0;
+
+  // Clean up model name for display
+  // Only show model name for claude engine; other engines don't use the model field
+  const shortModel = engine && engine !== 'claude'
+    ? engine
+    : model
+      ? model.replace(/^claude-/, '').replace(/-\d{8}$/, '')
+      : null;
 
   const statusColors = {
     running: 'bg-green-500',
@@ -46,6 +54,14 @@ function ProjectCard({ project }) {
 
       <h3 className="text-lg font-semibold text-white mb-1 truncate">{name}</h3>
       <p className="text-sm text-gray-500 truncate mb-3" title={path}>{path}</p>
+
+      {shortModel && (
+        <div className="mb-3">
+          <span className="text-xs bg-gray-700 text-gray-300 px-2 py-0.5 rounded-full" title={`${engine || 'unknown'} / ${model}`}>
+            {shortModel}
+          </span>
+        </div>
+      )}
 
       {isAlive && state && (
         <div className="flex items-center justify-between text-sm">

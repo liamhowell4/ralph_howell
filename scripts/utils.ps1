@@ -503,23 +503,26 @@ Convert this PRD to JSON with this structure:
   "description": "string",
   "tasks": [
     {
-      "id": 1,
+      "id": "1",
       "title": "string",
       "description": "string",
       "status": "pending",
       "acceptanceCriteria": ["string"],
-      "dependencies": []
+      "dependencies": [],
+      "subtasks": []
     }
   ],
   "dependencyGraph": {
-    "nodes": [1, 2, 3],
-    "edges": [{"from": 1, "to": 2}]
+    "nodes": ["1", "2", "3"],
+    "edges": [{"from": "1", "to": "2"}]
   }
 }
 
 Rules:
+- ALL task IDs must be strings (e.g. "1", "2", "7.1")
 - Extract ALL tasks from the Task Checklist section
-- Each checkbox item becomes a task with sequential IDs starting at 1
+- Each top-level checkbox item becomes a task with sequential string IDs starting at "1"
+- If a task has sub-items (indented checkboxes), create subtasks with decimal IDs (e.g. task "7" gets subtasks "7.1", "7.2", "7.3")
 - Set all statuses to "pending"
 - IMPORTANT: Parse task dependencies from the PRD content:
   - Look for patterns like "depends on task N", "after task N", "requires task N"
@@ -994,7 +997,7 @@ function Update-TaskStatus {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [int]$TaskId,
+        [string]$TaskId,
 
         [Parameter(Mandatory = $true)]
         [ValidateSet("pending", "in_progress", "completed", "blocked")]
@@ -1009,7 +1012,16 @@ function Update-TaskStatus {
         return
     }
 
+    # Search top-level tasks and subtasks
     $task = $prd.tasks | Where-Object { $_.id -eq $TaskId }
+    if (-not $task) {
+        foreach ($t in $prd.tasks) {
+            if ($t.subtasks) {
+                $task = $t.subtasks | Where-Object { $_.id -eq $TaskId }
+                if ($task) { break }
+            }
+        }
+    }
     if ($task) {
         $task.status = $Status
         Save-RalphPrd -Prd $prd -ProjectPath $ProjectPath
@@ -1725,11 +1737,19 @@ function Get-TaskTimeoutCount {
 
     # Handle both hashtable and PSCustomObject (from JSON deserialization)
     if ($state.taskTimeouts -is [hashtable]) {
-        return if ($state.taskTimeouts.ContainsKey($TaskId)) { $state.taskTimeouts[$TaskId] } else { 0 }
+        if ($state.taskTimeouts.ContainsKey($TaskId)) {
+            return $state.taskTimeouts[$TaskId]
+        } else {
+            return 0
+        }
     } else {
         # PSCustomObject from JSON
         $value = $state.taskTimeouts.PSObject.Properties[$TaskId]
-        return if ($value) { $value.Value } else { 0 }
+        if ($value) {
+            return $value.Value
+        } else {
+            return 0
+        }
     }
 }
 
@@ -2201,33 +2221,54 @@ function Invoke-Codex {
                 -Status "running" `
                 -ProjectPath $ProjectPath
 
-            # Write prompt to temp file for stdin
-            $tempPromptFile = [System.IO.Path]::GetTempFileName()
-            $tempStdoutFile = [System.IO.Path]::GetTempFileName()
-            $tempStderrFile = [System.IO.Path]::GetTempFileName()
-            Set-Content -Path $tempPromptFile -Value $Prompt -Encoding UTF8
-
             # Get model from config if available
             $codexModel = $config.codexModel
 
-            # Build codex command - use stdin via "-" argument
-            $codexCmd = if ($codexModel) {
-                "Get-Content '$tempPromptFile' -Raw | codex exec - -m '$codexModel' --dangerously-bypass-approvals-and-sandbox --json"
-            } else {
-                "Get-Content '$tempPromptFile' -Raw | codex exec - --dangerously-bypass-approvals-and-sandbox --json"
+            # Build codex args - use stdin via "-" argument
+            $codexArgs = "exec - --dangerously-bypass-approvals-and-sandbox --json"
+            if ($codexModel) {
+                $codexArgs = "exec - -m $codexModel --dangerously-bypass-approvals-and-sandbox --json"
             }
 
-            # Use Start-Process with powershell.exe to properly handle the script wrapper
+            # Launch codex via cmd.exe to handle .cmd/.ps1 wrappers on Windows.
+            # Using cmd /c avoids the powershell.exe wrapper that caused
+            # encoding issues and stream disconnects.
             $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = "powershell.exe"
-            $psi.Arguments = "-NoProfile -NonInteractive -Command `"$codexCmd`""
+            $psi.FileName = "cmd.exe"
+            $psi.Arguments = "/c codex $codexArgs"
             $psi.UseShellExecute = $false
+            $psi.RedirectStandardInput = $true
             $psi.RedirectStandardOutput = $true
             $psi.RedirectStandardError = $true
             $psi.CreateNoWindow = $true
             $psi.WorkingDirectory = $ProjectPath
 
             $process = [System.Diagnostics.Process]::Start($psi)
+
+            # Write prompt to stdin and close it so codex knows input is complete
+            $process.StandardInput.Write($Prompt)
+            $process.StandardInput.Close()
+
+            # Use async reads to prevent deadlock when stdout/stderr buffers fill up.
+            # Without this, the child process blocks writing to a full pipe buffer
+            # and never exits, causing Ralph to hit the timeout every time.
+            $stdoutBuilder = New-Object System.Text.StringBuilder
+            $stderrBuilder = New-Object System.Text.StringBuilder
+
+            $stdoutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
+                if ($null -ne $EventArgs.Data) {
+                    $Event.MessageData.AppendLine($EventArgs.Data)
+                }
+            } -MessageData $stdoutBuilder
+
+            $stderrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
+                if ($null -ne $EventArgs.Data) {
+                    $Event.MessageData.AppendLine($EventArgs.Data)
+                }
+            } -MessageData $stderrBuilder
+
+            $process.BeginOutputReadLine()
+            $process.BeginErrorReadLine()
 
             # Poll for completion with timeout, updating state periodically
             $startTime = Get-Date
@@ -2249,10 +2290,9 @@ function Invoke-Codex {
                         Write-RalphLog "Failed to kill process: $_" -Level "ERROR"
                     }
 
-                    # Cleanup temp files
-                    Remove-Item $tempPromptFile -Force -ErrorAction SilentlyContinue
-                    Remove-Item $tempStdoutFile -Force -ErrorAction SilentlyContinue
-                    Remove-Item $tempStderrFile -Force -ErrorAction SilentlyContinue
+                    # Cleanup async event handlers
+                    Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
+                    Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
 
                     Update-RalphState -Updates @{
                         iterationStatus = "timeout"
@@ -2289,14 +2329,16 @@ function Invoke-Codex {
                 Start-Sleep -Milliseconds 500
             }
 
-            # Process completed - read output
-            $output = $process.StandardOutput.ReadToEnd()
-            $stderr = $process.StandardError.ReadToEnd()
+            # Wait briefly for async reads to flush remaining data
+            $process.WaitForExit()
 
-            # Cleanup temp files
-            Remove-Item $tempPromptFile -Force -ErrorAction SilentlyContinue
-            Remove-Item $tempStdoutFile -Force -ErrorAction SilentlyContinue
-            Remove-Item $tempStderrFile -Force -ErrorAction SilentlyContinue
+            # Cleanup async event handlers
+            Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
+            Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
+
+            # Collect output from async builders
+            $output = $stdoutBuilder.ToString()
+            $stderr = $stderrBuilder.ToString()
 
             $elapsedMinutes = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
 
@@ -2306,46 +2348,53 @@ function Invoke-Codex {
             } -ProjectPath $ProjectPath
 
             if ($process.ExitCode -ne 0) {
-                Write-RalphLog "Codex process exited with code $($process.ExitCode): $stderr" -Level "ERROR"
+                # Codex may exit non-zero but still produce valid output (e.g. stream reconnect errors).
+                # Check if we got an agent_message before treating as hard failure.
+                $hasAgentMessage = $output -match '"type":"agent_message"'
+                if ($hasAgentMessage) {
+                    Write-RalphLog "Codex exited with code $($process.ExitCode) but produced output. Treating as success. stderr: $($stderr.Substring(0, [Math]::Min(200, $stderr.Length)))" -Level "WARN"
+                } else {
+                    Write-RalphLog "Codex process exited with code $($process.ExitCode): $stderr" -Level "ERROR"
 
-                # Update conversation log with error
-                if ($convEntryId) {
-                    Update-ConversationEntry `
-                        -EntryId $convEntryId `
-                        -Response $output `
-                        -Status "error" `
-                        -ElapsedMinutes $elapsedMinutes `
-                        -Error "Codex exited with code $($process.ExitCode): $stderr" `
-                        -ProjectPath $ProjectPath
-                }
+                    # Update conversation log with error
+                    if ($convEntryId) {
+                        Update-ConversationEntry `
+                            -EntryId $convEntryId `
+                            -Response $output `
+                            -Status "error" `
+                            -ElapsedMinutes $elapsedMinutes `
+                            -Error "Codex exited with code $($process.ExitCode): $stderr" `
+                            -ProjectPath $ProjectPath
+                    }
 
-                return @{
-                    Success = $false
-                    Output = $output
-                    Error = "Codex exited with code $($process.ExitCode): $stderr"
+                    return @{
+                        Success = $false
+                        Output = $output
+                        Error = "Codex exited with code $($process.ExitCode): $stderr"
+                    }
                 }
             }
 
             # Parse Codex JSONL output - extract the response content
             # Codex returns JSONL (one JSON object per line)
+            # Example output:
+            #   {"type":"thread.started","thread_id":"..."}
+            #   {"type":"item.completed","item":{"type":"error","message":"Under-development features..."}}
+            #   {"type":"turn.started"}
+            #   {"type":"item.completed","item":{"type":"agent_message","text":"actual response"}}
+            #   {"type":"turn.completed","usage":{...}}
             $parsedOutput = $null
             $outputLines = $output -split "`n" | Where-Object { $_.Trim() }
             foreach ($line in $outputLines) {
                 try {
                     $jsonObj = $line | ConvertFrom-Json
-                    # Codex format: {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+                    # Primary Codex format: agent_message contains the actual response
                     if ($jsonObj.type -eq "item.completed" -and $jsonObj.item.type -eq "agent_message" -and $jsonObj.item.text) {
                         $parsedOutput = $jsonObj.item.text
                     }
-                    # Fallback patterns for other formats
-                    elseif ($jsonObj.type -eq "message" -and $jsonObj.content) {
-                        $parsedOutput = $jsonObj.content
-                    } elseif ($jsonObj.message) {
-                        $parsedOutput = $jsonObj.message
-                    } elseif ($jsonObj.output) {
-                        $parsedOutput = $jsonObj.output
-                    } elseif ($jsonObj.result) {
-                        $parsedOutput = $jsonObj.result
+                    # Skip error/warning items (e.g. "Under-development features" warnings)
+                    elseif ($jsonObj.type -eq "item.completed" -and $jsonObj.item.type -eq "error") {
+                        Write-RalphLog "Codex warning/error item: $($jsonObj.item.message)" -Level "DEBUG"
                     }
                 } catch {
                     # Not valid JSON, skip
@@ -2806,23 +2855,18 @@ function Invoke-EngineSimple {
         }
 
         # Parse JSONL output - codex outputs multiple JSON lines
+        # Skip error/warning items, only extract agent_message text
         $outputLines = $jsonContent -split "`n" | Where-Object { $_.Trim() }
         foreach ($line in $outputLines) {
             try {
                 $jsonObj = $line | ConvertFrom-Json
-                # Codex format: {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+                # Primary Codex format: agent_message contains the actual response
                 if ($jsonObj.type -eq "item.completed" -and $jsonObj.item.type -eq "agent_message" -and $jsonObj.item.text) {
                     return $jsonObj.item.text
                 }
-                # Fallback patterns for other formats
-                elseif ($jsonObj.type -eq "message" -and $jsonObj.content) {
-                    return $jsonObj.content
-                } elseif ($jsonObj.message) {
-                    return $jsonObj.message
-                } elseif ($jsonObj.output) {
-                    return $jsonObj.output
-                } elseif ($jsonObj.result) {
-                    return $jsonObj.result
+                # Skip error/warning items (e.g. "Under-development features" warnings)
+                elseif ($jsonObj.type -eq "item.completed" -and $jsonObj.item.type -eq "error") {
+                    Write-RalphLog "Codex warning/error item: $($jsonObj.item.message)" -Level "DEBUG"
                 }
             } catch {
                 # Not valid JSON, skip

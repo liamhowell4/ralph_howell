@@ -98,6 +98,7 @@ function readLogTail(lines = 100) {
  */
 app.get('/api/health', (req, res) => {
   const state = readJsonFile('state.json');
+  const config = readJsonFile('config.json');
 
   res.json({
     status: 'healthy',
@@ -106,6 +107,8 @@ app.get('/api/health', (req, res) => {
     projectName: PROJECT_PATH.split(/[/\\]/).pop(),
     port: PORT,
     uptime: process.uptime(),
+    engine: config?.engine || null,
+    model: config?.model || null,
     state: state ? {
       status: state.status,
       currentIteration: state.currentIteration,
